@@ -1,0 +1,3282 @@
+---
+title: "SAIL data extract"
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r cache_config, include=FALSE}
+use_cache <- TRUE
+cache_dir  <- file.path(getwd(), "cache_desc")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+
+cache_or_run <- function(cache_file, expr) {
+  if (isTRUE(use_cache) && file.exists(cache_file)) {
+    message("[cache] Loading from disk: ", basename(cache_file))
+    readRDS(cache_file)
+  } else {
+    message("[cache] Running computation: ", basename(cache_file))
+    result <- expr()
+    saveRDS(result, cache_file)
+    message("[cache] Saved: ", basename(cache_file))
+    result
+  }
+}
+```
+
+```{r data_source, include=FALSE}
+
+data_source            <- "sail"
+react_model_file <- "P:/kingd/GitKraken/1483_Paper-3/Re-run - New classes/msm_cvd_object_FINAL_EXCL_NHDL.qs"
+
+# ── Mapping helpers ────────────────────────────────────────────────────────────
+map_ehr_ethnicity <- function(x) {
+  dplyr::case_when(
+    grepl("white",       x, ignore.case=TRUE) ~ "White",
+    grepl("south asian|indian|pakistani|bangladeshi", x, ignore.case=TRUE) ~ "South Asian",
+    grepl("black|african|caribbean", x, ignore.case=TRUE) ~ "Black",
+    grepl("mixed",       x, ignore.case=TRUE) ~ "Mixed",
+    grepl("chinese|other asian|other",    x, ignore.case=TRUE) ~ "Other",
+    TRUE                                      ~ "White"
+  )
+}
+
+map_ehr_smoking <- function(x) {
+  x <- as.character(x)
+  dplyr::case_when(
+    x %in% c("0","Never","Non-smoker","N")            ~ "Non-smoker",
+    x %in% c("1","Ex","Ex-smoker","Former","E")       ~ "Ex-smoker",
+    x %in% c("2","Light","1-9","<10")                 ~ "Light",
+    x %in% c("3","Moderate","10-19","10-20")          ~ "Moderate",
+    x %in% c("4","Heavy","20+",">20",">=20")          ~ "Heavy",
+    TRUE                                               ~ "Non-smoker"
+  )
+}
+
+map_smoke_cat <- function(s) {
+  mp <- c("Non-smoker"=0L, "Ex-smoker"=1L, "Light"=2L, "Moderate"=3L, "Heavy"=4L)
+  as.integer(mp[s])
+}
+
+map_ethrisk <- function(e) {
+  mp <- c("White"=1L, "South Asian"=3L, "Black"=6L, "Mixed"=2L, "Other"=9L)
+  v  <- mp[e]; v[is.na(v)] <- 1L; as.integer(v)
+}
+
+clamp_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+```
+
+```{r libs, include=FALSE}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(ggh4x)
+  library(knitr)
+  library(kableExtra)
+  library(scales)
+  library(plotly)
+  library(mice)
+  library(qs)
+})
+dir.create("figures", showWarnings = FALSE)
+```
+
+```{r qrisk_functions, include=FALSE}
+# ── QRISK2-2015 female ────────────────────────────────────────────────────────
+qrisk2_2015_female <- function(age, bmi, sbp, rati, town, smoke_cat, ethrisk,
+                                b_AF=0, b_ra=0, b_renal=0, b_treatedhyp=0,
+                                b_type1=0, b_type2=0, fh_cvd=0, surv=10L) {
+  survivor <- c(0, 0.999128758907318, 0.998222172260284, 0.997292637825012,
+                0.996305286884308, 0.995250642299652, 0.994234919548035,
+                0.993183135986328, 0.992080569267273, 0.990928232669830,
+                0.989747583866119, 0.988448619842529, 0.987112879753113,
+                0.985681176185608, 0.984169244766235, 0.982512056827545)
+  Iethrisk <- c(0, 0,
+                 0.25740993498319259, 0.61297954305717794, 0.33621598416696213,
+                 0.15125173032243364, -0.17941562596577681, -0.35034236100577454,
+                 -0.27783724832332168, -0.15927341226653660)
+  Ismoke <- c(0, 0.21193771087603852, 0.66186343796859415,
+               0.75707145871323056, 0.94962982514570360)
+
+  dage  <- age / 10; dbmi <- bmi / 10
+  age_1 <- sqrt(dage);      age_2 <- dage
+  bmi_1 <- dbmi^(-2);       bmi_2 <- dbmi^(-2) * log(dbmi)
+
+  age_1 <- age_1 - 2.086397409439087;  age_2 <- age_2 - 4.353054523468018
+  bmi_1 <- bmi_1 - 0.152244374155998;  bmi_2 <- bmi_2 - 0.143282383680344
+  rati  <- rati  - 3.506655454635620;  sbp   <- sbp   - 125.040039062500000
+  town  <- town  - 0.416743695735931
+
+  a <- Iethrisk[clamp_vec(ethrisk, 1L, 9L) + 1L] + Ismoke[clamp_vec(smoke_cat, 0L, 4L) + 1L]
+
+  a <- a + age_1 * 4.4417863976316578   + age_2 * 0.028163721067299918
+  a <- a + bmi_1 * 0.89423653047106633  + bmi_2 * (-6.5748047596104335)
+  a <- a + rati  * 0.14339005616214209  + sbp   * 0.012897179584361372
+  a <- a + town  * 0.066477263001143885
+  a <- a + b_AF  * 1.6284780236484424   + b_ra  * 0.29012331040887707
+  a <- a + b_renal * 1.0043796680368302 + b_treatedhyp * 0.61804305627881295
+  a <- a + b_type1 * 1.8400348250874599 + b_type2 * 1.1711626412196512
+  a <- a + fh_cvd  * 0.51472612036651955
+
+  a <- a + age_1 * (smoke_cat==1) *  0.74644061443916665
+  a <- a + age_1 * (smoke_cat==2) *  0.25685417118796666
+  a <- a + age_1 * (smoke_cat==3) * -1.5452226707866523
+  a <- a + age_1 * (smoke_cat==4) * -1.7113013709043405
+  a <- a + age_1 * b_AF           * -7.0177986441269269
+  a <- a + age_1 * b_renal        * -2.9684019256454390
+  a <- a + age_1 * b_treatedhyp   * -4.2219906452967848
+  a <- a + age_1 * b_type1        *  1.6835769546040080
+  a <- a + age_1 * b_type2        * -2.9371798540034648
+  a <- a + age_1 * bmi_1          *  0.17971962070446823
+  a <- a + age_1 * bmi_2          * 40.242816676065814
+  a <- a + age_1 * fh_cvd         *  0.14399792407539067
+  a <- a + age_1 * sbp            * -0.036257523389977446
+  a <- a + age_1 * town           *  0.37351380314334426
+
+  a <- a + age_2 * (smoke_cat==1) * -0.19270577417482310
+  a <- a + age_2 * (smoke_cat==2) * -0.15269650634589327
+  a <- a + age_2 * (smoke_cat==3) *  0.23135639765214294
+  a <- a + age_2 * (smoke_cat==4) *  0.23071650138682967
+  a <- a + age_2 * b_AF           *  1.1395776028337732
+  a <- a + age_2 * b_renal        *  0.43569632083309406
+  a <- a + age_2 * b_treatedhyp   *  0.72659471088872396
+  a <- a + age_2 * b_type1        * -0.63209777662756539
+  a <- a + age_2 * b_type2        *  0.40232704348710868
+  a <- a + age_2 * bmi_1          *  0.13192766227118777
+  a <- a + age_2 * bmi_2          * -7.3211322435546409
+  a <- a + age_2 * fh_cvd         * -0.13302600182737204
+  a <- a + age_2 * sbp            *  0.0045842850495397955
+  a <- a + age_2 * town           * -0.095237030084599078
+
+  surv <- as.integer(clamp_vec(surv, 1L, 15L))
+  100.0 * (1.0 - survivor[surv + 1L]^exp(a))
+}
+
+# ── QRISK2-2015 male ──────────────────────────────────────────────────────────
+qrisk2_2015_male <- function(age, bmi, sbp, rati, town, smoke_cat, ethrisk,
+                              b_AF=0, b_ra=0, b_renal=0, b_treatedhyp=0,
+                              b_type1=0, b_type2=0, fh_cvd=0, surv=10L) {
+  survivor <- c(0, 0.998205721378326, 0.996380507946014, 0.994511783123016,
+                0.992520809173584, 0.990338504314423, 0.988223373889923,
+                0.986053407192230, 0.983751118183136, 0.981297850608826,
+                0.978794217109680, 0.976175725460052, 0.973336458206177,
+                0.970354199409485, 0.967230498790741, 0.963918387889862)
+  Iethrisk <- c(0, 0,
+                 0.31733214304819191, 0.47385907860811155, 0.51713146559681455,
+                 0.13703011573664192, -0.38855223049726639, -0.38124954853121945,
+                 -0.40644613816509945, -0.22857155213773361)
+  Ismoke <- c(0, 0.26844791581580202, 0.63076749738775917,
+               0.71780788833786957, 0.87041725334654851)
+
+  dage  <- age / 10; dbmi <- bmi / 10
+  age_1 <- dage^(-1);       age_2 <- dage^2
+  bmi_1 <- dbmi^(-2);       bmi_2 <- dbmi^(-2) * log(dbmi)
+
+  age_1 <- age_1 - 0.233734160661697;  age_2 <- age_2 - 18.304403305053711
+  bmi_1 <- bmi_1 - 0.146269768476486;  bmi_2 <- bmi_2 - 0.140587374567986
+  rati  <- rati  - 4.321151256561279;  sbp   <- sbp   - 130.589752197265620
+  town  <- town  - 0.551009356975555
+
+  a <- Iethrisk[clamp_vec(ethrisk, 1L, 9L) + 1L] + Ismoke[clamp_vec(smoke_cat, 0L, 4L) + 1L]
+
+  a <- a + age_1 * (-18.043731255037727) + age_2 * 0.023648645425430694
+  a <- a + bmi_1 *   2.5388084343581578  + bmi_2 * (-9.1034725871528597)
+  a <- a + rati  *   0.16843976361369095 + sbp   * 0.010500308938075482
+  a <- a + town  *   0.032380163763448759
+  a <- a + b_AF  *   1.0363048000259454  + b_ra  * 0.25199531347910126
+  a <- a + b_renal * 0.83593528869952860 + b_treatedhyp * 0.66034596959178626
+  a <- a + b_type1 * 1.3309170433446138  + b_type2 * 0.94543488927744179
+  a <- a + fh_cvd  * 0.59860378971362815
+
+  a <- a + age_1 * (smoke_cat==1) *  0.61868646993796839
+  a <- a + age_1 * (smoke_cat==2) *  1.5522017055600055
+  a <- a + age_1 * (smoke_cat==3) *  2.4407210657517648
+  a <- a + age_1 * (smoke_cat==4) *  3.5140494491884624
+  a <- a + age_1 * b_AF           *  8.0382925558108482
+  a <- a + age_1 * b_renal        * -1.6389521229064483
+  a <- a + age_1 * b_treatedhyp   *  8.4621771382346651
+  a <- a + age_1 * b_type1        *  5.4977016563835504
+  a <- a + age_1 * b_type2        *  3.3974747488766690
+  a <- a + age_1 * bmi_1          * 33.848988101276760
+  a <- a + age_1 * bmi_2          * (-140.67070254048971)
+  a <- a + age_1 * fh_cvd         *  2.0858333154353321
+  a <- a + age_1 * sbp            *  0.050128366883072054
+  a <- a + age_1 * town           * -0.19882682171868507
+
+  a <- a + age_2 * (smoke_cat==1) * -0.0040893975066796338
+  a <- a + age_2 * (smoke_cat==2) * -0.0056065852346001768
+  a <- a + age_2 * (smoke_cat==3) * -0.0018261006189440492
+  a <- a + age_2 * (smoke_cat==4) * -0.0014997157296173290
+  a <- a + age_2 * b_AF           *  0.0052471594895864343
+  a <- a + age_2 * b_renal        * -0.017966358619354639
+  a <- a + age_2 * b_treatedhyp   *  0.0092088445323379176
+  a <- a + age_2 * b_type1        *  0.0047493510223424558
+  a <- a + age_2 * b_type2        * -0.0048113775783491563
+  a <- a + age_2 * bmi_1          *  0.062741075751394565
+  a <- a + age_2 * bmi_2          * -0.23829149093857321
+  a <- a + age_2 * fh_cvd         * -0.0049971149213281010
+  a <- a + age_2 * sbp            * -0.000052370098795143509
+  a <- a + age_2 * town           * -0.0012518116569283104
+
+  surv <- as.integer(clamp_vec(surv, 1L, 15L))
+  100.0 * (1.0 - survivor[surv + 1L]^exp(a))
+}
+
+qrisk2_2015 <- function(sex, age, bmi, sbp, rati, town,
+                         smoke_cat, ethrisk,
+                         b_AF=0, b_ra=0, b_renal=0,
+                         b_treatedhyp=0, b_type1=0,
+                         b_type2=0, fh_cvd=0, surv=10L) {
+  sex1 <- toupper(substr(as.character(sex), 1, 1))
+  out  <- rep(NA_real_, length(sex1))
+  f    <- which(sex1 == "F")
+  m    <- which(sex1 == "M")
+  if (length(f))
+    out[f] <- qrisk2_2015_female(age[f], bmi[f], sbp[f], rati[f], town[f],
+                                  smoke_cat[f], ethrisk[f], b_AF[f], b_ra[f],
+                                  b_renal[f], b_treatedhyp[f], b_type1[f],
+                                  b_type2[f], fh_cvd[f], surv)
+  if (length(m))
+    out[m] <- qrisk2_2015_male(age[m], bmi[m], sbp[m], rati[m], town[m],
+                                smoke_cat[m], ethrisk[m], b_AF[m], b_ra[m],
+                                b_renal[m], b_treatedhyp[m], b_type1[m],
+                                b_type2[m], fh_cvd[m], surv)
+  out
+}
+```
+
+```{r analysis_functions, include=FALSE}
+# ── QRISK2 preparation (DM cohort) ────────────────────────────────────────────
+prepare_qrisk_dm <- function(dm_df) {
+  if (!requireNamespace("mice", quietly = TRUE))
+    stop("prepare_qrisk_dm: 'mice' package required")
+
+  town_center <- ifelse(dm_df$sex == "F", 0.416743695735931, 0.551009356975555)
+  dm_df$townsend[is.na(dm_df$townsend)] <- town_center[is.na(dm_df$townsend)]
+
+  imp_df <- data.frame(
+    smk      = factor(dm_df$smoking_status,
+                      levels = c("Non-smoker","Ex-smoker","Light","Moderate","Heavy"),
+                      ordered = TRUE),
+    bmi      = as.numeric(dm_df$bmi),
+    sbp      = as.numeric(dm_df$sbp),
+    tc_hdl   = as.numeric(dm_df$tc_hdl),
+    age      = as.integer(dm_df$age),
+    sex      = dm_df$sex,
+    ldl      = as.numeric(dm_df$ldl),
+    aht      = as.integer(dm_df$aht_flag),
+    ckd      = as.integer(dm_df$ckd)
+  )
+
+  method          <- mice::make.method(imp_df)
+  method["smk"]   <- "polr"
+  method["bmi"]   <- "pmm"
+  method["sbp"]   <- "pmm"
+  method["tc_hdl"]<- "pmm"
+  method[c("age","sex","ldl","aht","ckd")] <- ""
+
+  n_miss <- c(smk=sum(is.na(imp_df$smk)), bmi=sum(is.na(imp_df$bmi)),
+              sbp=sum(is.na(imp_df$sbp)), tc_hdl=sum(is.na(imp_df$tc_hdl)))
+  if (any(n_miss > 0)) {
+    set.seed(500L)
+    imputed <- mice::complete(
+      mice::mice(imp_df, m=1L, method=method, seed=500L, printFlag=FALSE)
+    )
+    dm_df$smoking_status <- as.character(imputed$smk)
+    dm_df$bmi    <- imputed$bmi
+    dm_df$sbp    <- imputed$sbp
+    dm_df$tc_hdl <- imputed$tc_hdl
+  }
+  dm_df
+}
+
+# ── REACT score computation ────────────────────────────────────────────────────
+compute_react_scores <- function(ascvd_df, model_file, surv_years=5L) {
+  for (pkg in c("qs","msm","mice")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      stop("compute_react_scores: '", pkg, "' package required")
+  }
+  message("[REACT] Loading MSM model: ", model_file)
+  msm.cvd <- qs::qread(model_file)
+
+  n_sex_na <- sum(is.na(ascvd_df$sex))
+  if (n_sex_na > 0) {
+    modal_sex <- names(sort(table(ascvd_df$sex), decreasing=TRUE))[1]
+    ascvd_df$sex[is.na(ascvd_df$sex)] <- modal_sex
+  }
+
+  smk_react <- dplyr::case_when(
+    ascvd_df$smoking_status == "Non-smoker" ~ "Non-smoker",
+    ascvd_df$smoking_status == "Ex-smoker"  ~ "Ex-smoker",
+    ascvd_df$smoking_status %in% c("Light","Moderate","Heavy") ~ "Active smoker",
+    TRUE ~ NA_character_
+  )
+
+  imp_df <- data.frame(
+    alf      = ascvd_df$alf,
+    he       = as.integer(ascvd_df$hard_event),
+    age      = as.integer(ascvd_df$age),
+    sex      = ascvd_df$sex,
+    type     = factor(case_when(ascvd_df$vascular_territory == 'Stroke' ~ 'ST',
+                                TRUE ~ ascvd_df$vascular_territory),
+                      levels=c("IHD","Stroke","PAD"), ordered=FALSE),
+    wimd     = as.integer(ascvd_df$wimd),
+    smk      = factor(smk_react,
+                      levels=c("Non-smoker","Ex-smoker","Active smoker"), ordered=TRUE),
+    dm       = as.integer(ascvd_df$dm_comorbid),
+    dmta     = as.integer(ascvd_df$dmta),
+    lvr      = as.integer(ascvd_df$liver_disease),
+    htn      = as.integer(ascvd_df$htn),
+    hf       = as.integer(ascvd_df$hf),
+    nhdl_val = as.numeric(ascvd_df$non_hdl),
+    egfr_val = as.numeric(ascvd_df$egfr),
+    stringsAsFactors=FALSE
+  )
+
+  impute_vars        <- imp_df[, setdiff(names(imp_df), c("alf","he"))]
+  method             <- mice::make.method(impute_vars)
+  method["smk"]      <- "polr"
+  method["nhdl_val"] <- "pmm"
+  method["egfr_val"] <- "pmm"
+
+  set.seed(500L)
+  imputed <- mice::complete(
+    mice::mice(impute_vars, m=1L, method=method, seed=500L, printFlag=FALSE)
+  )
+  imp_df[, names(imputed)] <- imputed
+
+  imp_df$smk_msm <- factor(as.character(imp_df$smk),
+                            levels=c("Non-smoker","Ex-smoker","Active smoker","Unknown"),
+                            ordered=FALSE)
+  imp_df$nhdl <- factor(dplyr::case_when(
+    imp_df$nhdl_val <= 4.3 ~ "<= 4.3",
+    imp_df$nhdl_val >  4.3 ~ "> 4.3"
+  ), levels=c("<= 4.3","> 4.3"))
+  imp_df$egfr <- factor(dplyr::case_when(
+    imp_df$egfr_val >  60                         ~ "> 60",
+    imp_df$egfr_val >= 30 & imp_df$egfr_val <= 60 ~ "30 - 60",
+    imp_df$egfr_val <  30                         ~ "< 30"
+  ), levels=c("> 60","30 - 60","< 30"))
+  imp_df$age_cat <- factor(dplyr::case_when(
+    imp_df$age <  50                        ~ "< 50",
+    imp_df$age >= 50 & imp_df$age <= 59     ~ "50 - 59",
+    imp_df$age >= 60 & imp_df$age <= 69     ~ "60 - 69",
+    imp_df$age >= 70 & imp_df$age <= 79     ~ "70 - 79",
+    imp_df$age >= 80                        ~ "80 - 85"
+  ), levels=c("< 50","50 - 59","60 - 69","70 - 79","80 - 85"))
+
+  n     <- nrow(imp_df)
+  entry <- ifelse(imp_df$he == 1L, 3L, 1L)
+  tick  <- max(1L, n %/% 20L)
+  message(sprintf("[REACT] Computing passage probabilities for %d patients...", n))
+
+  react_5y <- vapply(seq_len(n), function(i) {
+    if (i %% tick == 0L)
+      message(sprintf("[REACT]   %d / %d  (%.0f%%)", i, n, 100*i/n))
+    passage <- msm::ppass.msm(
+      msm.cvd, tot=surv_years,
+      covariates=list(
+        Age                      = imp_df$age_cat[i],
+        Sex                      = imp_df$sex[i],
+        Index_vascular_territory = imp_df$type[i],
+        WIMD_Quintile            = imp_df$wimd[i],
+        Smoker_status            = imp_df$smk_msm[i],
+        Diabetes                 = imp_df$dm[i],
+        Dementia                 = imp_df$dmta[i],
+        Liver_disease            = imp_df$lvr[i],
+        Hypertension             = imp_df$htn[i],
+        Heart_failure            = imp_df$hf[i],
+        non_HDL                  = imp_df$nhdl[i],
+        eGFR                     = imp_df$egfr[i]
+      )
+    ) |> unclass() |> as.data.frame() |> tibble::rownames_to_column("State")
+    prob <- if (entry[i] == 3L) passage$`State 4`[3L] else passage$`State 2`[1L]
+    as.numeric(prob) * 100
+  }, numeric(1L))
+
+  data.frame(alf=imp_df$alf, react_5y_risk=react_5y)
+}
+
+# ── Cohort loader ──────────────────────────────────────────────────────────────
+load_ehr_cohorts <- function(react_model_file=NULL) {
+  if (!requireNamespace("sailr", quietly=TRUE))
+    stop("sailr package required.")
+  conn <- sailr::db2_open()
+  on.exit(try(sailr::db2_close(conn), silent=TRUE))
+
+  raw <- sailr::db2_run(conn, "
+    SELECT
+      ALF_PE      AS alf,
+      COHORT      AS cohort,
+      HE          AS hard_event,
+      SEX         AS sex,
+      AGE         AS age,
+      ETHN        AS ethnicity_raw,
+      SMK         AS smoking_raw,
+      TYPE        AS diabetes_type,
+      WIMD        AS wimd,
+      TOWNSEND    AS townsend,
+      BMI         AS bmi,
+      SBP_VAL     AS sbp,
+      LDL_VAL     AS ldl,
+      TC_HDL      AS tc_hdl_ratio,
+      NHDL_VAL    AS non_hdl,
+      EGFR_VAL    AS egfr,
+      DM          AS dm_comorbid,
+      DMTA        AS dmta,
+      LVR         AS liver_disease,
+      HTN         AS htn,
+      HF          AS hf,
+      AF          AS af,
+      RA          AS rheumatoid_arthritis,
+      FH_CVD      AS fh_chd_u60,
+      CKD         AS ckd,
+      STATIN      AS statin_rx,
+      LLT_INT     AS llt_int,
+      AHT         AS aht_flag,
+      AHT_INT     AS aht_int
+    FROM SAILW1483V.CAPSTONE_RISK_CALCULATION_COHORT
+  ")
+
+  clean_cohort <- function(df) {
+    df |>
+      dplyr::mutate(
+        ethnicity          = map_ehr_ethnicity(as.character(ethnicity_raw)),
+        smoking_status     = map_ehr_smoking(as.character(smoking_raw)),
+        sbp      = as.numeric(sbp),
+        ldl      = as.numeric(ldl),
+        tc_hdl   = as.numeric(tc_hdl_ratio),
+        non_hdl  = as.numeric(non_hdl),
+        bmi      = as.numeric(bmi),
+        egfr     = as.numeric(egfr),
+        wimd     = as.integer(wimd),
+        townsend = as.numeric(townsend),
+        statin_rx_last6m = as.integer(statin_rx),
+        llt_int          = as.integer(llt_int),
+        aht_int          = as.integer(aht_int),
+        aht_flag         = as.integer(aht_flag),
+        treated_htn      = as.integer(aht_flag),
+        dm_type1 = as.integer(cohort == "DM" & !is.na(diabetes_type) &
+                                toupper(diabetes_type) == "T1"),
+        dm_type2 = as.integer(cohort == "DM" & (is.na(diabetes_type) |
+                                toupper(diabetes_type) %in% c("T2","U"))),
+        vascular_territory = dplyr::case_when(
+          cohort == "ASCVD" & toupper(diabetes_type) == "IHD"    ~ "IHD",
+          cohort == "ASCVD" & toupper(diabetes_type) == "STROKE" ~ "Stroke",
+          cohort == "ASCVD" & toupper(diabetes_type) == "PAD"    ~ "PAD",
+          TRUE ~ NA_character_
+        ),
+        ckd                  = as.integer(ckd),
+        hf                   = as.integer(hf),
+        af                   = as.integer(af),
+        rheumatoid_arthritis = as.integer(rheumatoid_arthritis),
+        fh_chd_u60           = as.integer(fh_chd_u60),
+        liver_disease        = as.integer(liver_disease),
+        htn                  = as.integer(htn),
+        dm_comorbid          = as.integer(dm_comorbid),
+        dmta                 = as.integer(dmta),
+        hard_event           = as.integer(hard_event),
+        age                  = as.integer(age)
+      ) |>
+      dplyr::select(-ethnicity_raw, -smoking_raw, -tc_hdl_ratio)
+  }
+
+  all_data <- clean_cohort(raw)
+  dm    <- dplyr::filter(all_data, cohort == "DM")
+  ascvd <- dplyr::filter(all_data, cohort == "ASCVD")
+
+  dm <- prepare_qrisk_dm(dm)
+
+  react_scores        <- compute_react_scores(ascvd, model_file=react_model_file)
+  ascvd$react_5y_risk <- react_scores$react_5y_risk[match(ascvd$alf, react_scores$alf)]
+
+  message(sprintf("[ehr] DM cohort: %d patients | ASCVD cohort: %d patients",
+                  nrow(dm), nrow(ascvd)))
+  list(dm=dm, ascvd=ascvd)
+}
+
+# ── QRISK2 recalculation for DM agents ────────────────────────────────────────
+recalc_qrisk_dm <- function(df) {
+  dm <- df$cohort == "DM"
+  if (!any(dm)) return(df)
+  sub <- df[dm, ]
+  smoke_cat <- map_smoke_cat(sub$smoking_status)
+  smoke_cat[is.na(smoke_cat)] <- 0L
+  rati <- pmax(as.numeric(sub$tc_hdl), 1.0)
+  b_treatedhyp <- as.integer(sub$aht_int >= 1)
+  town <- as.numeric(sub$townsend); town[is.na(town)] <- 0.0
+
+  df$qrisk10y[dm] <- qrisk2_2015(
+    sex=sub$sex, age=as.numeric(sub$age), bmi=sub$bmi, sbp=sub$sbp,
+    rati=rati, town=town, smoke_cat=smoke_cat,
+    ethrisk=map_ethrisk(sub$ethnicity),
+    b_AF=sub$af, b_ra=sub$rheumatoid_arthritis, b_renal=sub$ckd,
+    b_treatedhyp=b_treatedhyp,
+    b_type1=sub$dm_type1, b_type2=sub$dm_type2,
+    fh_cvd=sub$fh_chd_u60
+  )
+  df
+}
+
+# ── Compute baseline risk scores ───────────────────────────────────────────────
+# Adds qrisk10y and react5y columns to a combined cohort data frame.
+compute_risk_scores <- function(dm_df, ascvd_df) {
+  dm_df$cohort    <- "DM"
+  ascvd_df$cohort <- "ASCVD"
+  df <- dplyr::bind_rows(dm_df, ascvd_df)
+
+  df$qrisk10y <- NA_real_
+  df$react5y  <- ifelse(df$cohort == "ASCVD", df$react_5y_risk, NA_real_)
+  df <- recalc_qrisk_dm(df)
+
+  list(
+    dm    = df[df$cohort == "DM", ],
+    ascvd = df[df$cohort == "ASCVD", ]
+  )
+}
+
+# ── Baseline characteristics table ────────────────────────────────────────────
+make_baseline_table <- function(dm_df, ascvd_df) {
+  overall <- dplyr::bind_rows(dm_df, ascvd_df)
+
+  pct <- function(x)   sprintf("%d (%.1f%%)", sum(x, na.rm=TRUE), 100*mean(x, na.rm=TRUE))
+  mn  <- function(x)   sprintf("%.1f (%.1f)", mean(x, na.rm=TRUE), sd(x, na.rm=TRUE))
+  mn2 <- function(x)   sprintf("%.2f (%.2f)", mean(x, na.rm=TRUE), sd(x, na.rm=TRUE))
+
+  summ <- function(df, cohort="overall") {
+    is_dm <- cohort == "DM"
+    vt <- function(val) {
+      if (is_dm) return("-")
+      pct(df$vascular_territory == val)
+    }
+    list(
+      "N"                               = nrow(df),
+      "Age (years)"                     = mn(df$age),
+      "Male sex"                        = pct(df$sex == "M"),
+      "Systolic blood pressure (mmHg)"  = mn(df$sbp),
+      "Body mass index (kg/m²)"         = mn(df$bmi),
+      "LDL cholesterol (mmol/L)"        = mn2(df$ldl),
+      "Statin in last 6 months"         = pct(df$statin_rx_last6m),
+      "Treated hypertension"            = pct(df$treated_htn),
+      "Atrial fibrillation"             = pct(df$af),
+      "CKD stage 3-5"                   = pct(df$ckd),
+      "Rheumatoid arthritis"            = pct(df$rheumatoid_arthritis),
+      "Family history of CHD <60 years" = pct(df$fh_chd_u60),
+      "Townsend deprivation score"      = mn(df$townsend),
+      "IHD"                             = vt("IHD"),
+      "Stroke"                          = vt("Stroke"),
+      "Peripheral arterial disease"     = vt("PAD"),
+      "Diabetes mellitus"               = if (is_dm) "-" else pct(df$cohort == "DM" | df$dm_comorbid == 1L),
+      "Heart failure"                   = pct(df$hf),
+      "Liver disease"                   = pct(df$liver_disease),
+      "Dementia"                        = pct(df$dmta),
+      "Non-HDL-C ≤4.3 mmol/L"          = pct(df$non_hdl <= 4.3),
+      "eGFR >60 mL/min/1.73m²"         = pct(df$egfr > 60),
+      "WIMD quintile 1 (most deprived)" = pct(df$wimd == 1L)
+    )
+  }
+
+  so <- summ(overall, "overall")
+  sa <- summ(ascvd_df, "ASCVD")
+  sd_ <- summ(dm_df,   "DM")
+
+  data.frame(
+    Characteristic = names(so),
+    Overall        = unlist(so),
+    ASCVD          = unlist(sa),
+    DM             = unlist(sd_),
+    stringsAsFactors=FALSE, row.names=NULL
+  )
+}
+
+# ── Treatment rate table ───────────────────────────────────────────────────────
+# Proportion of patients at each LLT intensity (0–4) and AHT intensity (0–4),
+# by cohort. Returns a long data frame suitable for stacked bar charts.
+compute_treatment_rates <- function(dm_df, ascvd_df) {
+  cohorts <- list(
+    list(name="DM (primary)",      df=dm_df),
+    list(name="ASCVD (secondary)", df=ascvd_df)
+  )
+  llt_labs <- c("0"="No treatment","1"="Other treatment","2"="LI statin",
+                "3"="HI statin","4"="Combination therapy")
+  aht_labs <- c("0"="No treatment","1"="1 drug class","2"="2 classes",
+                "3"="3 classes","4"="4 classes")
+
+  dplyr::bind_rows(lapply(cohorts, function(co) {
+    df <- co$df
+    llt <- table(factor(df$llt_int, levels=0:4)) / nrow(df) * 100
+    aht <- table(factor(df$aht_int, levels=0:4)) / nrow(df) * 100
+    dplyr::bind_rows(
+      data.frame(Cohort=co$name, Treatment="LLT",
+                 Intensity=names(llt_labs), Label=llt_labs,
+                 Pct=as.numeric(llt), stringsAsFactors=FALSE),
+      data.frame(Cohort=co$name, Treatment="AHT",
+                 Intensity=names(aht_labs), Label=aht_labs,
+                 Pct=as.numeric(aht), stringsAsFactors=FALSE)
+    )
+  }))
+}
+
+# ── Treatment gap ──────────────────────────────────────────────────────────────
+compute_treatment_gap <- function(dm_df, ascvd_df) {
+  ldl_target_dm    <- 2.0
+  ldl_target_ascvd <- 1.8
+  sbp_target       <- 130.0
+  specs <- list(
+    list(cname="DM",    df=dm_df,    ldl_tgt=ldl_target_dm),
+    list(cname="ASCVD", df=ascvd_df, ldl_tgt=ldl_target_ascvd)
+  )
+  dplyr::bind_rows(lapply(specs, function(sp) {
+    df <- sp$df
+    data.frame(
+      Cohort                    = sp$cname,
+      N                         = nrow(df),
+      `LDL at target (%)`       = round(100*mean(df$ldl <= sp$ldl_tgt, na.rm=TRUE), 1),
+      `Mean LDL gap (mmol/L)`   = round(mean(pmax(df$ldl - sp$ldl_tgt, 0), na.rm=TRUE), 2),
+      `On LLT (%)`           = round(100*mean(df$statin_rx_last6m, na.rm=TRUE), 1),
+      `SBP at target (%)`       = round(100*mean(df$sbp <= sbp_target, na.rm=TRUE), 1),
+      `Mean SBP gap (mmHg)`     = round(mean(pmax(df$sbp - sbp_target, 0), na.rm=TRUE), 1),
+      `On AHT (%)` = round(100*mean(df$treated_htn, na.rm=TRUE), 1),
+      check.names=FALSE, stringsAsFactors=FALSE
+    )
+  }))
+}
+
+# ── Detailed treatment gap breakdown ──────────────────────────────────────────
+compute_treatment_gap_detailed <- function(dm_df, ascvd_df) {
+  ldl_target_dm <- 2.0; ldl_target_ascvd <- 1.8; sbp_target <- 130.0
+  specs <- list(
+    list(cname="DM",    df=dm_df,    ldl_tgt=ldl_target_dm),
+    list(cname="ASCVD", df=ascvd_df, ldl_tgt=ldl_target_ascvd)
+  )
+  ldl_rows <- dplyr::bind_rows(lapply(specs, function(sp) {
+    df  <- sp$df; tgt <- sp$ldl_tgt
+    on_llt <- df$llt_int > 0L
+    at_tgt <- !is.na(df$ldl) & df$ldl <= tgt
+    pct <- function(x) round(100 * mean(x, na.rm=TRUE), 1)
+    data.frame(
+      Cohort   = sp$cname,
+      Category = c("No LLT, at target", "LLT, at target",
+                   "LLT, not at target", "No LLT, not at target"),
+      N   = c(sum(!on_llt &  at_tgt, na.rm=TRUE), sum( on_llt &  at_tgt, na.rm=TRUE),
+              sum( on_llt & !at_tgt, na.rm=TRUE), sum(!on_llt & !at_tgt, na.rm=TRUE)),
+      Pct = c(pct(!on_llt &  at_tgt), pct( on_llt &  at_tgt),
+              pct( on_llt & !at_tgt), pct(!on_llt & !at_tgt)),
+      stringsAsFactors = FALSE
+    )
+  }))
+  sbp_rows <- dplyr::bind_rows(lapply(specs, function(sp) {
+    df  <- sp$df
+    at_tgt <- !is.na(df$sbp) & df$sbp <= sbp_target
+    pct <- function(x) round(100 * mean(x, na.rm=TRUE), 1)
+    data.frame(
+      Cohort   = sp$cname,
+      Category = c("At target", "1-3 agents, above target",
+                   "4 agents, above target", "No AHT, above target"),
+      N   = c(sum( at_tgt, na.rm=TRUE),
+              sum(!at_tgt & df$aht_int %in% 1:3, na.rm=TRUE),
+              sum(!at_tgt & df$aht_int == 4L,    na.rm=TRUE),
+              sum(!at_tgt & df$aht_int == 0L,    na.rm=TRUE)),
+      Pct = c(pct( at_tgt), pct(!at_tgt & df$aht_int %in% 1:3),
+              pct(!at_tgt & df$aht_int == 4L), pct(!at_tgt & df$aht_int == 0L)),
+      stringsAsFactors = FALSE
+    )
+  }))
+  list(ldl=ldl_rows, sbp=sbp_rows)
+}
+
+# ── Target attainment and risk projection table ────────────────────────────────
+# Uses meta-analytic RRs to project how risk changes under each scenario without
+# running the ABM. Based on HR = RR_SBP^(ΔSBP/10) × RR_LDL^ΔLDL.
+#
+# Key design: project_risk() takes simultaneous deltas for BOTH cohorts and
+# returns one qrisk and one react value. The outer loop builds per-cohort biomarker
+# rows (Mean, Delta, % at target) but shares the same risk projection across
+# both cohort rows for a given scenario - avoiding the bug where dplyr::first()
+# in reshape_tbl would pick up whichever cohort happened to be listed first.
+make_target_tables <- function(dm_df, ascvd_df) {
+  rr_sbp_dm    <- 0.90; rr_ldl_dm    <- 0.79
+  rr_sbp_ascvd <- 0.80; rr_ldl_ascvd <- 0.78
+  ldl_target_dm <- 2.0; ldl_target_ascvd <- 1.8; sbp_target <- 130.0
+
+  scored  <- compute_risk_scores(dm_df, ascvd_df)
+  dm_s    <- scored$dm; ascvd_s <- scored$ascvd
+
+  project_risk <- function(d_sbp_dm=0, d_ldl_dm=0, d_sbp_ascvd=0, d_ldl_ascvd=0) {
+    .pr <- function(s_dm, l_dm, s_asc, l_asc) {
+      hr_dm    <- s_dm^(d_sbp_dm/10)     * l_dm^d_ldl_dm
+      hr_ascvd <- s_asc^(d_sbp_ascvd/10) * l_asc^d_ldl_ascvd
+      list(
+        qrisk = round(mean(clamp_vec(dm_s$qrisk10y   * hr_dm,    0, 100), na.rm=TRUE), 1),
+        react = round(mean(clamp_vec(ascvd_s$react5y * hr_ascvd, 0, 100), na.rm=TRUE), 1)
+      )
+    }
+    cen <- .pr(0.90, 0.79, 0.80, 0.78)
+    pes <- .pr(0.95, 0.86, 0.83, 0.80)
+    opt <- .pr(0.84, 0.72, 0.77, 0.76)
+    list(qrisk=cen$qrisk, react=cen$react,
+         qrisk_lo=opt$qrisk, qrisk_hi=pes$qrisk,
+         react_lo=opt$react, react_hi=pes$react)
+  }
+
+  ldl_dm    <- dm_df$ldl;    ldl_ascvd <- ascvd_df$ldl
+  sbp_dm    <- dm_df$sbp;    sbp_ascvd <- ascvd_df$sbp
+
+  rows_ldl <- list()
+  for (cov in c(0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.00)) {
+    d_dm    <- cov * mean(pmax(ldl_dm    - ldl_target_dm,    0), na.rm=TRUE)
+    d_ascvd <- cov * mean(pmax(ldl_ascvd - ldl_target_ascvd, 0), na.rm=TRUE)
+    rs      <- project_risk(d_ldl_dm=d_dm, d_ldl_ascvd=d_ascvd)
+    pct_dm    <- 100 * (mean(ldl_dm    <= ldl_target_dm,    na.rm=TRUE) +
+                        cov * mean(ldl_dm    > ldl_target_dm,    na.rm=TRUE))
+    pct_ascvd <- 100 * (mean(ldl_ascvd <= ldl_target_ascvd, na.rm=TRUE) +
+                        cov * mean(ldl_ascvd > ldl_target_ascvd, na.rm=TRUE))
+    scen <- if (cov == 0) "Baseline" else sprintf("%d%% at target", as.integer(cov * 100))
+    for (info in list(list("DM", ldl_dm, d_dm, pct_dm),
+                      list("ASCVD", ldl_ascvd, d_ascvd, pct_ascvd))) {
+      rows_ldl[[length(rows_ldl)+1]] <- data.frame(
+        Cohort=info[[1]], Scenario=scen,
+        Mean=round(mean(info[[2]], na.rm=TRUE) - info[[3]], 2), Delta=round(info[[3]], 2),
+        pct_at_target=round(info[[4]], 1),
+        mean_qrisk=rs$qrisk, mean_react=rs$react,
+        qrisk_lo=rs$qrisk_lo, qrisk_hi=rs$qrisk_hi,
+        react_lo=rs$react_lo, react_hi=rs$react_hi)
+    }
+  }
+
+  rows_sbp <- list()
+  for (cov in c(0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.00)) {
+    d_dm    <- cov * mean(pmax(sbp_dm    - sbp_target, 0), na.rm=TRUE)
+    d_ascvd <- cov * mean(pmax(sbp_ascvd - sbp_target, 0), na.rm=TRUE)
+    rs      <- project_risk(d_sbp_dm=d_dm, d_sbp_ascvd=d_ascvd)
+    pct_dm    <- 100 * (mean(sbp_dm    <= sbp_target, na.rm=TRUE) +
+                        cov * mean(sbp_dm    > sbp_target, na.rm=TRUE))
+    pct_ascvd <- 100 * (mean(sbp_ascvd <= sbp_target, na.rm=TRUE) +
+                        cov * mean(sbp_ascvd > sbp_target, na.rm=TRUE))
+    scen <- if (cov == 0) "Baseline" else sprintf("%d%% at target", as.integer(cov * 100))
+    for (info in list(list("DM", sbp_dm, d_dm, pct_dm),
+                      list("ASCVD", sbp_ascvd, d_ascvd, pct_ascvd))) {
+      rows_sbp[[length(rows_sbp)+1]] <- data.frame(
+        Cohort=info[[1]], Scenario=scen,
+        Mean=round(mean(info[[2]], na.rm=TRUE) - info[[3]], 1), Delta=round(info[[3]], 1),
+        pct_at_target=round(info[[4]], 1),
+        mean_qrisk=rs$qrisk, mean_react=rs$react,
+        qrisk_lo=rs$qrisk_lo, qrisk_hi=rs$qrisk_hi,
+        react_lo=rs$react_lo, react_hi=rs$react_hi)
+    }
+  }
+
+  reshape_tbl <- function(rows, biomarker, decimals=2) {
+    df <- do.call(rbind, rows)
+    scen_order <- unique(df$Scenario)
+    base_pct <- stats::setNames(
+      df$pct_at_target[df$Scenario == "Baseline"],
+      df$Cohort[df$Scenario == "Baseline"]
+    )
+    df$delta_pct <- df$pct_at_target - base_pct[df$Cohort]
+    df$pct_str <- ifelse(df$Scenario == "Baseline",
+      sprintf("%.1f%%", df$pct_at_target),
+      sprintf("%.1f%%<br>(+%.1f%%)", df$pct_at_target, df$delta_pct))
+    fmt     <- function(x, d=decimals) formatC(x, format="f", digits=d)
+    fmt_neg <- function(x, d=decimals) ifelse(x == 0, fmt(0, d), paste0("-", fmt(x, d)))
+    df$mean_str <- ifelse(df$Scenario == "Baseline", fmt(df$Mean),
+      paste0(fmt(df$Mean), "<br>(", fmt_neg(df$Delta), ")"))
+    risk_cols <- df |>
+      dplyr::group_by(Scenario) |>
+      dplyr::summarise(
+        qrisk=dplyr::first(mean_qrisk), react=dplyr::first(mean_react),
+        qrisk_lo=dplyr::first(qrisk_lo), qrisk_hi=dplyr::first(qrisk_hi),
+        react_lo=dplyr::first(react_lo), react_hi=dplyr::first(react_hi),
+        .groups="drop")
+    qr_base <- risk_cols$qrisk[risk_cols$Scenario == "Baseline"]
+    re_base <- risk_cols$react[risk_cols$Scenario == "Baseline"]
+    fmt1 <- function(x) formatC(x, format="f", digits=1)
+    is_base <- risk_cols$Scenario == "Baseline"
+    risk_cols$`QRISK2 10y (%)` <- ifelse(is_base, fmt1(risk_cols$qrisk),
+      paste0(fmt1(risk_cols$qrisk), "<br>(",
+             ifelse(qr_base-risk_cols$qrisk==0, fmt1(0), paste0("-",fmt1(qr_base-risk_cols$qrisk))), ")"))
+    risk_cols$`QRISK2 95% CI` <- ifelse(is_base, "—",
+      paste0(fmt1(risk_cols$qrisk_lo), "–", fmt1(risk_cols$qrisk_hi)))
+    risk_cols$`REACT 5y (%)` <- ifelse(is_base, fmt1(risk_cols$react),
+      paste0(fmt1(risk_cols$react), "<br>(",
+             ifelse(re_base-risk_cols$react==0, fmt1(0), paste0("-",fmt1(re_base-risk_cols$react))), ")"))
+    risk_cols$`REACT 95% CI` <- ifelse(is_base, "—",
+      paste0(fmt1(risk_cols$react_lo), "–", fmt1(risk_cols$react_hi)))
+    risk_cols <- risk_cols[, c("Scenario","QRISK2 10y (%)","QRISK2 95% CI","REACT 5y (%)","REACT 95% CI")]
+    wide <- tidyr::pivot_wider(
+      df[, c("Cohort","Scenario","mean_str","pct_str")],
+      id_cols="Scenario", names_from="Cohort",
+      values_from=c("mean_str","pct_str"))
+    wide <- wide[, c("Scenario","mean_str_DM","pct_str_DM","mean_str_ASCVD","pct_str_ASCVD")]
+    names(wide) <- c("Scenario","DM Mean (Δ)","DM % at target","ASCVD Mean (Δ)","ASCVD % at target")
+    wide <- dplyr::left_join(wide, risk_cols, by="Scenario")
+    wide <- wide[match(scen_order[!duplicated(scen_order)], wide$Scenario), ]
+    wide <- wide[, c("Scenario","DM Mean (Δ)","DM % at target","QRISK2 10y (%)","QRISK2 95% CI",
+                     "ASCVD Mean (Δ)","ASCVD % at target","REACT 5y (%)","REACT 95% CI")]
+    wide$biomarker <- biomarker
+    wide
+  }
+
+  ldl_tbl <- reshape_tbl(rows_ldl, "LDL-C (mmol/L)", decimals=2)
+  sbp_tbl <- reshape_tbl(rows_sbp, "SBP (mmHg)",     decimals=1)
+  list(ldl=ldl_tbl, sbp=sbp_tbl, combined=dplyr::bind_rows(ldl_tbl, sbp_tbl))
+}
+
+# ── Events prevented analysis ──────────────────────────────────────────────────
+# For each combination of risk quartile and intervention level, estimates the
+# number of 5-year CVD events prevented per 1,000 patients using the meta-analytic
+# RR formula: events_prevented = N × baseline_5yr_risk × (1 - HR)
+# where HR = RR_SBP^(ΔSBP/10) × RR_LDL^ΔLDL.
+#
+# QRISK2 is a 10-year score; conversion to 5-year: p_5yr = 1 - (1-p_10yr)^0.5
+compute_opportunity <- function(dm_df, ascvd_df, dm_scores, ascvd_scores) {
+  rr_sbp_dm    <- 0.90; rr_ldl_dm    <- 0.79
+  rr_sbp_ascvd <- 0.80; rr_ldl_ascvd <- 0.78
+
+  # Intervention levels: (label, d_sbp_mmhg, d_ldl_mmol)
+  interventions <- list(
+    list(label="Mild\n(5mmHg / 0.3mmol)", d_sbp=5,  d_ldl=0.3),
+    list(label="Moderate\n(10mmHg / 0.6mmol)", d_sbp=10, d_ldl=0.6),
+    list(label="Intensive\n(15mmHg / 1.0mmol)", d_sbp=15, d_ldl=1.0)
+  )
+
+  # DM quartiles based on QRISK2 10yr, then converted to 5yr
+  q_dm <- quantile(dm_scores$qrisk10y, probs=c(0,0.25,0.5,0.75,1), na.rm=TRUE)
+  dm_merged <- dm_df
+  dm_merged$qrisk10y   <- dm_scores$qrisk10y[match(dm_df$alf, dm_scores$alf)]
+  dm_merged$risk_q     <- cut(dm_merged$qrisk10y, breaks=q_dm,
+                               labels=c("Q1 (lowest)","Q2","Q3","Q4 (highest)"),
+                               include.lowest=TRUE)
+  dm_merged$risk5y     <- 1 - (1 - dm_merged$qrisk10y/100)^0.5
+
+  q_ascvd <- quantile(ascvd_scores$react5y, probs=c(0,0.25,0.5,0.75,1), na.rm=TRUE)
+  ascvd_merged <- ascvd_df
+  ascvd_merged$react5y  <- ascvd_scores$react5y[match(ascvd_df$alf, ascvd_scores$alf)]
+  ascvd_merged$risk_q   <- cut(ascvd_merged$react5y, breaks=q_ascvd,
+                                 labels=c("Q1 (lowest)","Q2","Q3","Q4 (highest)"),
+                                 include.lowest=TRUE)
+  ascvd_merged$risk5y   <- ascvd_merged$react5y / 100
+
+  dplyr::bind_rows(lapply(interventions, function(iv) {
+    hr_dm    <- rr_sbp_dm^(iv$d_sbp/10)    * rr_ldl_dm^iv$d_ldl
+    hr_ascvd <- rr_sbp_ascvd^(iv$d_sbp/10) * rr_ldl_ascvd^iv$d_ldl
+
+    dm_res <- dm_merged |>
+      dplyr::filter(!is.na(risk_q)) |>
+      dplyr::group_by(risk_q) |>
+      dplyr::summarise(
+        events_prevented_per1k = mean(risk5y, na.rm=TRUE) * (1 - hr_dm) * 1000,
+        n = dplyr::n(), .groups="drop"
+      ) |>
+      dplyr::mutate(Cohort="DM (primary)", Intervention=iv$label)
+
+    ascvd_res <- ascvd_merged |>
+      dplyr::filter(!is.na(risk_q)) |>
+      dplyr::group_by(risk_q) |>
+      dplyr::summarise(
+        events_prevented_per1k = mean(risk5y, na.rm=TRUE) * (1 - hr_ascvd) * 1000,
+        n = dplyr::n(), .groups="drop"
+      ) |>
+      dplyr::mutate(Cohort="ASCVD (secondary)", Intervention=iv$label)
+
+    dplyr::bind_rows(dm_res, ascvd_res)
+  }))
+}
+
+# ── 3D opportunity landscape matrix ───────────────────────────────────────────
+# Returns a matrix of events prevented per 1,000 patients, indexed by
+# risk quartile (rows) and SBP reduction band (columns).
+# Used for the plotly surface plot - DM and ASCVD produced separately.
+compute_sbp_risk_matrix <- function(scored_df, cohort_type) {
+  rr_sbp    <- if (cohort_type == "DM") 0.90 else 0.80
+  rr_ldl    <- if (cohort_type == "DM") 0.79 else 0.78
+  risk_col  <- if (cohort_type == "DM") "qrisk10y" else "react5y"
+  to_5yr    <- cohort_type == "DM"   # QRISK2 is 10-yr; REACT is already 5-yr
+
+  sbp_reductions <- c(0, 2.5, 5, 7.5, 10, 12.5, 15, 20)
+  ldl_reductions <- sbp_reductions * 0.06  # co-vary LDL proportionally (mild assumption)
+
+  q <- quantile(scored_df[[risk_col]], probs=c(0,0.25,0.5,0.75,1), na.rm=TRUE)
+  scored_df$risk_q <- cut(scored_df[[risk_col]], breaks=q,
+                           labels=c("Q1","Q2","Q3","Q4"),
+                           include.lowest=TRUE)
+
+  risk5y_by_q <- scored_df |>
+    dplyr::filter(!is.na(risk_q)) |>
+    dplyr::group_by(risk_q) |>
+    dplyr::summarise(
+      mean_risk5y = {
+        r <- mean(.data[[risk_col]], na.rm=TRUE) / 100
+        if (to_5yr) 1 - (1 - r)^0.5 else r
+      },
+      .groups="drop"
+    )
+
+  mat <- outer(
+    risk5y_by_q$mean_risk5y,
+    seq_along(sbp_reductions),
+    FUN=function(risk, idx) {
+      d_sbp <- sbp_reductions[idx]
+      d_ldl <- ldl_reductions[idx]
+      hr    <- rr_sbp^(d_sbp/10) * rr_ldl^d_ldl
+      risk * (1 - hr) * 1000
+    }
+  )
+  rownames(mat) <- as.character(risk5y_by_q$risk_q)
+  colnames(mat) <- paste0(sbp_reductions, "mmHg")
+  mat
+}
+```
+
+```{r theme, include=FALSE}
+theme_cap <- function() {
+  theme_minimal(base_size=11) +
+    theme(legend.position="bottom",
+          legend.title=element_text(face="bold"),
+          panel.grid.minor=element_blank(),
+          strip.text=element_text(face="bold"))
+}
+
+dx_pal <- c("Stable diagnosis"="#56026a", "MACE diagnosis"="#34aa6f")
+```
+
+```{r run_analysis, include=FALSE}
+# Use a separate cache file per data source so switching doesn't require
+# manual cache deletion.
+.desc_cache_file <- file.path(
+  cache_dir,
+  if (data_source == "synthetic") "descriptive_synthetic.rds" else "descriptive.rds"
+)
+
+desc_cache <- cache_or_run(
+  .desc_cache_file,
+  function() {
+    .prog <- function(...) message(sprintf("[%s] %s", format(Sys.time(), "%H:%M:%S"), paste0(...)))
+
+    # ── Load cohorts ───────────────────────────────────────────────────────────
+    if (data_source == "synthetic") {
+      .prog("Step 1/6 - loading synthetic cohorts from ", synthetic_cohorts_file)
+      .ext <- tools::file_ext(synthetic_cohorts_file)
+      syn  <- if (.ext == "qs") qs::qread(synthetic_cohorts_file)
+              else               readRDS(synthetic_cohorts_file)
+      dm_base    <- syn$dm
+      ascvd_base <- syn$ascvd
+      .prog("  DM n=", nrow(dm_base), "  ASCVD n=", nrow(ascvd_base))
+    } else {
+      # Reuse main analysis cache to avoid re-running ~15,000 ppass.msm calls
+      main_cache_file <- file.path("cache", "analysis.rds")
+      if (file.exists(main_cache_file)) {
+        .prog("Step 1/6 - loading cohorts from main analysis cache")
+        main_cache <- readRDS(main_cache_file)
+        dm_base    <- main_cache$dm_base
+        ascvd_base <- main_cache$ascvd_base
+        rm(main_cache)
+      } else {
+        .prog("Step 1/6 - loading cohorts from SAIL (main cache not found)")
+        cohorts    <- load_ehr_cohorts(react_model_file=react_model_file)
+        dm_base    <- cohorts$dm
+        ascvd_base <- cohorts$ascvd
+      }
+    }
+    
+    .prog("Step 2/6 - baseline table")
+    baseline_table <- make_baseline_table(dm_base, ascvd_base)
+
+    .prog("Step 3/6 - risk scores")
+    scored      <- compute_risk_scores(dm_base, ascvd_base)
+    dm_scored   <- scored$dm
+    ascvd_scored <- scored$ascvd
+
+    .prog("Step 4/6 - treatment rates and gap")
+    treatment_rates <- compute_treatment_rates(dm_base, ascvd_base)
+    treatment_gap   <- compute_treatment_gap(dm_base, ascvd_base)
+
+    .prog("Step 5/6 - biomarker target tables")
+    target_tbls     <- make_target_tables(dm_base, ascvd_base)
+    biomarker_table <- target_tbls$combined
+
+    .prog("Step 6/6 - opportunity analysis")
+    opportunity_df <- compute_opportunity(dm_base, ascvd_base, dm_scored, ascvd_scored)
+    mat_dm    <- compute_sbp_risk_matrix(dm_scored,    "DM")
+    mat_ascvd <- compute_sbp_risk_matrix(ascvd_scored, "ASCVD")
+
+    list(
+      dm_base=dm_base, ascvd_base=ascvd_base,
+      dm_scored=dm_scored, ascvd_scored=ascvd_scored,
+      baseline_table=baseline_table,
+      treatment_rates=treatment_rates,
+      treatment_gap=treatment_gap,
+      biomarker_table=biomarker_table,
+      opportunity_df=opportunity_df,
+      mat_dm=mat_dm, mat_ascvd=mat_ascvd
+    )
+  }
+)
+
+list2env(desc_cache, envir=environment())
+ldl_target_dm <- 2.0; ldl_target_ascvd <- 1.8; sbp_target <- 130.0
+```
+
+```{r, include = FALSE}
+
+qsave(dm_base, 'dm_base.qs')
+qsave(ascvd_base, 'ascvd_base.qs')  
+
+```
+
+
+```{r inline_values, include=FALSE}
+# ── Inline scalar values for narrative text ────────────────────────────────────
+# All placeholders in the results paragraphs are populated from this list (iv).
+rr_sbp_dm <- 0.90; rr_ldl_dm <- 0.79
+rr_sbp_ascvd <- 0.80; rr_ldl_ascvd <- 0.78
+
+.hr <- function(d_sbp=0, d_ldl=0, cohort=c("DM","ASCVD")) {
+  cohort <- match.arg(cohort)
+  if (cohort=="DM")    rr_sbp_dm^(d_sbp/10)    * rr_ldl_dm^d_ldl
+  else                 rr_sbp_ascvd^(d_sbp/10) * rr_ldl_ascvd^d_ldl
+}
+.mn <- function(x) mean(x, na.rm=TRUE)
+.pct <- function(x, digits=1) round(100 * .mn(x), digits)
+
+iv <- local({
+
+  # ── Cohort sizes ──────────────────────────────────────────────────────────
+  n_dm    <- nrow(dm_base);  n_ascvd <- nrow(ascvd_base)
+
+  # ── DM demographics ───────────────────────────────────────────────────────
+  mean_age_dm   <- round(.mn(dm_base$age), 1)
+  pct_male_dm   <- .pct(dm_base$sex == "M")
+  pct_htn_dm    <- .pct(dm_base$htn == 1L)
+  pct_hf_dm     <- .pct(dm_base$hf  == 1L)
+  pct_wimd1_dm  <- .pct(dm_base$wimd == 1L)
+  pct_statin_dm <- .pct(dm_base$statin_rx_last6m == 1L)
+  mean_ldl_dm   <- round(.mn(dm_base$ldl), 2)
+  sd_ldl_dm     <- round(sd(dm_base$ldl, na.rm=TRUE), 2)
+  mean_sbp_dm   <- round(.mn(dm_base$sbp), 1)
+  sd_sbp_dm     <- round(sd(dm_base$sbp, na.rm=TRUE), 1)
+
+  # ── ASCVD demographics ────────────────────────────────────────────────────
+  mean_age_ascvd   <- round(.mn(ascvd_base$age), 1)
+  pct_male_ascvd   <- .pct(ascvd_base$sex == "M")
+  pct_ihd          <- .pct(ascvd_base$vascular_territory == "IHD")
+  pct_stroke       <- .pct(ascvd_base$vascular_territory == "Stroke")
+  pct_pad          <- .pct(ascvd_base$vascular_territory == "PAD")
+  pct_htn_ascvd    <- .pct(ascvd_base$htn == 1L)
+  pct_hf_ascvd     <- .pct(ascvd_base$hf  == 1L)
+  pct_wimd1_ascvd  <- .pct(ascvd_base$wimd == 1L)
+  pct_statin_ascvd <- .pct(ascvd_base$statin_rx_last6m == 1L)
+  mean_ldl_ascvd   <- round(.mn(ascvd_base$ldl), 2)
+  sd_ldl_ascvd     <- round(sd(ascvd_base$ldl, na.rm=TRUE), 2)
+  mean_sbp_ascvd   <- round(.mn(ascvd_base$sbp), 1)
+  sd_sbp_ascvd     <- round(sd(ascvd_base$sbp, na.rm=TRUE), 1)
+
+  # ── Risk scores ───────────────────────────────────────────────────────────
+  mean_qrisk     <- round(.mn(dm_scored$qrisk10y), 1)
+  med_qrisk      <- round(median(dm_scored$qrisk10y, na.rm=TRUE), 1)
+  pct_qrisk_gt10 <- .pct(dm_scored$qrisk10y > 10)
+  pct_qrisk_gt20 <- .pct(dm_scored$qrisk10y > 20)
+  mean_react     <- round(.mn(ascvd_scored$react5y), 1)
+  med_react      <- round(median(ascvd_scored$react5y, na.rm=TRUE), 1)
+
+  # ── Scenario risk shifts ──────────────────────────────────────────────────
+  # At target: individual SBP and LDL gaps closed
+  d_sbp_dm    <- pmax(dm_scored$sbp    - sbp_target,       0)
+  d_sbp_asc   <- pmax(ascvd_scored$sbp - sbp_target,       0)
+  d_ldl_dm    <- pmax(dm_scored$ldl    - ldl_target_dm,    0)
+  d_ldl_asc   <- pmax(ascvd_scored$ldl - ldl_target_ascvd, 0)
+  hr_dm_tgt   <- rr_sbp_dm^(d_sbp_dm/10)   * rr_ldl_dm^d_ldl_dm
+  hr_asc_tgt  <- rr_sbp_ascvd^(d_sbp_asc/10) * rr_ldl_ascvd^d_ldl_asc
+  qrisk_attarget <- round(.mn(clamp_vec(dm_scored$qrisk10y   * hr_dm_tgt,  0, 100)), 1)
+  react_attarget <- round(.mn(clamp_vec(ascvd_scored$react5y * hr_asc_tgt, 0, 100)), 1)
+
+  # 50% at target: each patient closes 50% of their SBP + LDL gap simultaneously
+  hr_dm_50  <- rr_sbp_dm^(0.5*d_sbp_dm/10)    * rr_ldl_dm^(0.5*d_ldl_dm)
+  hr_asc_50 <- rr_sbp_ascvd^(0.5*d_sbp_asc/10) * rr_ldl_ascvd^(0.5*d_ldl_asc)
+  qrisk_50pct <- round(.mn(clamp_vec(dm_scored$qrisk10y   * hr_dm_50,  0, 100)), 1)
+  react_50pct <- round(.mn(clamp_vec(ascvd_scored$react5y * hr_asc_50, 0, 100)), 1)
+  delta_qrisk_50pct <- round(mean_qrisk  - qrisk_50pct, 1)
+  delta_react_50pct <- round(mean_react  - react_50pct, 1)
+
+  # 75% at target
+  hr_dm_75  <- rr_sbp_dm^(0.75*d_sbp_dm/10)    * rr_ldl_dm^(0.75*d_ldl_dm)
+  hr_asc_75 <- rr_sbp_ascvd^(0.75*d_sbp_asc/10) * rr_ldl_ascvd^(0.75*d_ldl_asc)
+  qrisk_75pct <- round(.mn(clamp_vec(dm_scored$qrisk10y   * hr_dm_75,  0, 100)), 1)
+  react_75pct <- round(.mn(clamp_vec(ascvd_scored$react5y * hr_asc_75, 0, 100)), 1)
+
+  # 100% at target (individual gaps: same as qrisk_attarget / react_attarget)
+  delta_qrisk_100pct <- round(mean_qrisk  - qrisk_attarget, 1)
+  delta_react_100pct <- round(mean_react  - react_attarget, 1)
+
+  # ── Treatment gap ─────────────────────────────────────────────────────────
+  tg <- treatment_gap
+  tg_dm  <- tg[tg$Cohort == "DM",  ]
+  tg_asc <- tg[tg$Cohort == "ASCVD",]
+
+  # ── Treatment intensity ───────────────────────────────────────────────────
+  pct_no_llt_dm      <- .pct(dm_base$llt_int  == 0L)
+  pct_high_llt_dm    <- .pct(dm_base$llt_int  == 3L)
+  pct_max_llt_dm     <- .pct(dm_base$llt_int  == 4L)
+  pct_no_llt_ascvd   <- .pct(ascvd_base$llt_int == 0L)
+  pct_high_llt_ascvd <- .pct(ascvd_base$llt_int == 3L)
+  pct_max_llt_ascvd  <- .pct(ascvd_base$llt_int == 4L)
+  pct_no_aht_dm      <- .pct(dm_base$aht_int  == 0L)
+  pct_no_aht_ascvd   <- .pct(ascvd_base$aht_int == 0L)
+
+  # ── Sex-stratified treatment and target attainment (for Discussion) ───────
+  .sx <- function(df, sx, expr)
+    round(eval(substitute(expr), dplyr::filter(df, sex == sx)), 1)
+  pct_statin_f_dm  <- .sx(dm_base,    "F", 100*mean(statin_rx_last6m==1L, na.rm=TRUE))
+  pct_statin_m_dm  <- .sx(dm_base,    "M", 100*mean(statin_rx_last6m==1L, na.rm=TRUE))
+  pct_statin_f_asc <- .sx(ascvd_base, "F", 100*mean(statin_rx_last6m==1L, na.rm=TRUE))
+  pct_statin_m_asc <- .sx(ascvd_base, "M", 100*mean(statin_rx_last6m==1L, na.rm=TRUE))
+  pct_ldl_f_dm     <- .sx(dm_base,    "F", 100*mean(ldl <= 2.0, na.rm=TRUE))
+  pct_ldl_m_dm     <- .sx(dm_base,    "M", 100*mean(ldl <= 2.0, na.rm=TRUE))
+  pct_ldl_f_asc    <- .sx(ascvd_base, "F", 100*mean(ldl <= 1.8, na.rm=TRUE))
+  pct_ldl_m_asc    <- .sx(ascvd_base, "M", 100*mean(ldl <= 1.8, na.rm=TRUE))
+
+
+  # ── WIMD summaries ────────────────────────────────────────────────────────
+  wimd_labs <- c("1 (most\ndeprived)", "2", "3", "4", "5 (least\ndeprived)")
+  dm_w  <- dm_scored    |> dplyr::filter(!is.na(wimd), wimd %in% 1:5) |>
+            dplyr::mutate(wimd_f = factor(wimd, 1:5, wimd_labs))
+  asc_w <- ascvd_scored |> dplyr::filter(!is.na(wimd), wimd %in% 1:5) |>
+            dplyr::mutate(wimd_f = factor(wimd, 1:5, wimd_labs))
+
+  w_dm <- dm_w  |> dplyr::group_by(wimd_f) |>
+    dplyr::summarise(qrisk=.mn(qrisk10y), ldl_tgt=.pct(ldl<=2.0), .groups="drop")
+  w_asc <- asc_w |> dplyr::group_by(wimd_f) |>
+    dplyr::summarise(react=.mn(react5y),  ldl_tgt=.pct(ldl<=1.8), .groups="drop")
+  w_pool <- dplyr::bind_rows(dm_w, asc_w) |> dplyr::group_by(wimd_f) |>
+    dplyr::summarise(sbp_tgt=.pct(sbp<=130), statin=.pct(statin_rx_last6m==1L),
+                     aht=.pct(treated_htn==1L), .groups="drop")
+
+  .wv <- function(df, col, q) df[[col]][df$wimd_f == wimd_labs[q]]
+
+  # ── Risk-quartile summaries ───────────────────────────────────────────────
+  q_labs <- c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+  dm_q <- dm_scored |> dplyr::filter(!is.na(qrisk10y)) |>
+    dplyr::mutate(risk_q = cut(qrisk10y, quantile(qrisk10y, c(0,.25,.5,.75,1), na.rm=TRUE),
+                               labels=q_labs, include.lowest=TRUE))
+  asc_q <- ascvd_scored |> dplyr::filter(!is.na(react5y)) |>
+    dplyr::mutate(risk_q = cut(react5y, quantile(react5y, c(0,.25,.5,.75,1), na.rm=TRUE),
+                               labels=q_labs, include.lowest=TRUE))
+  .qv <- function(df, q, expr) {
+    sub <- dplyr::filter(df, risk_q == q)
+    round(eval(substitute(expr), sub), 1)
+  }
+
+  # ── Opportunity (Figure 3) ────────────────────────────────────────────────
+  dm_q5  <- dm_q  |>
+    dplyr::filter(!is.na(sbp), !is.na(ldl)) |>
+    dplyr::mutate(
+      risk5y = 1 - (1 - qrisk10y/100)^0.5,
+      hr_tgt = rr_sbp_dm^(pmax(sbp - sbp_target, 0)/10) *
+               rr_ldl_dm^pmax(ldl - ldl_target_dm, 0)
+    )
+  asc_q5 <- asc_q |>
+    dplyr::filter(!is.na(sbp), !is.na(ldl)) |>
+    dplyr::mutate(
+      risk5y = react5y / 100,
+      hr_tgt = rr_sbp_ascvd^(pmax(sbp - sbp_target, 0)/10) *
+               rr_ldl_ascvd^pmax(ldl - ldl_target_ascvd, 0)
+    )
+  .opp_sq <- function(df, q)
+    round(mean(dplyr::filter(df, risk_q==q)$risk5y, na.rm=TRUE) * 1000, 1)
+  .opp_prev_cov <- function(df, q, cov, ldl_tgt, rr_sbp, rr_ldl) {
+    s <- dplyr::filter(df, risk_q==q)
+    hr_c <- rr_sbp^(cov*pmax(s$sbp-sbp_target,0)/10) * rr_ldl^(cov*pmax(s$ldl-ldl_tgt,0))
+    round(mean(s$risk5y * (1 - hr_c), na.rm=TRUE) * 1000, 1)
+  }
+  .opp_prev_tgt <- function(df, q) {
+    s <- dplyr::filter(df, risk_q==q)
+    round(mean(s$risk5y * (1 - s$hr_tgt), na.rm=TRUE) * 1000, 1)
+  }
+
+  events_sq_dm_q1    <- .opp_sq(dm_q5,  "Q1 (lowest)")
+  events_sq_dm_q4    <- .opp_sq(dm_q5,  "Q4 (highest)")
+  events_sq_ascvd_q1 <- .opp_sq(asc_q5, "Q1 (lowest)")
+  events_sq_ascvd_q4 <- .opp_sq(asc_q5, "Q4 (highest)")
+
+  prevented_50pct_dm_q4    <- .opp_prev_cov(dm_q5,  "Q4 (highest)", 0.50, ldl_target_dm,    rr_sbp_dm,    rr_ldl_dm)
+  prevented_50pct_dm_q1    <- .opp_prev_cov(dm_q5,  "Q1 (lowest)",  0.50, ldl_target_dm,    rr_sbp_dm,    rr_ldl_dm)
+  prevented_50pct_ascvd_q4 <- .opp_prev_cov(asc_q5, "Q4 (highest)", 0.50, ldl_target_ascvd, rr_sbp_ascvd, rr_ldl_ascvd)
+  prevented_50pct_ascvd_q1 <- .opp_prev_cov(asc_q5, "Q1 (lowest)",  0.50, ldl_target_ascvd, rr_sbp_ascvd, rr_ldl_ascvd)
+  prevented_tgt_dm_q4    <- .opp_prev_tgt(dm_q5,  "Q4 (highest)")
+  prevented_tgt_ascvd_q4 <- .opp_prev_tgt(asc_q5, "Q4 (highest)")
+
+  # ── Assemble ──────────────────────────────────────────────────────────────
+  list(
+    n_total            = format(n_dm + n_ascvd, big.mark=","),
+    n_dm               = format(n_dm, big.mark=","),
+    n_ascvd            = format(n_ascvd, big.mark=","),
+    mean_age_dm        = mean_age_dm,
+    pct_male_dm        = pct_male_dm,
+    mean_age_ascvd     = mean_age_ascvd,
+    pct_male_ascvd     = pct_male_ascvd,
+    pct_ihd            = pct_ihd,
+    pct_stroke         = pct_stroke,
+    pct_pad            = pct_pad,
+    pct_htn_dm         = pct_htn_dm,
+    pct_htn_ascvd      = pct_htn_ascvd,
+    pct_hf_dm          = pct_hf_dm,
+    pct_hf_ascvd       = pct_hf_ascvd,
+    pct_wimd1_dm       = pct_wimd1_dm,
+    pct_wimd1_ascvd    = pct_wimd1_ascvd,
+    pct_statin_dm      = pct_statin_dm,
+    pct_statin_ascvd   = pct_statin_ascvd,
+    mean_ldl_dm        = mean_ldl_dm,
+    sd_ldl_dm          = sd_ldl_dm,
+    mean_ldl_ascvd     = mean_ldl_ascvd,
+    sd_ldl_ascvd       = sd_ldl_ascvd,
+    mean_sbp_dm        = mean_sbp_dm,
+    sd_sbp_dm          = sd_sbp_dm,
+    mean_sbp_ascvd     = mean_sbp_ascvd,
+    sd_sbp_ascvd       = sd_sbp_ascvd,
+    mean_qrisk         = mean_qrisk,
+    med_qrisk          = med_qrisk,
+    pct_qrisk_gt10     = pct_qrisk_gt10,
+    pct_qrisk_gt20     = pct_qrisk_gt20,
+    mean_react         = mean_react,
+    med_react          = med_react,
+    qrisk_50pct        = qrisk_50pct,
+    react_50pct        = react_50pct,
+    delta_qrisk_50pct  = delta_qrisk_50pct,
+    delta_react_50pct  = delta_react_50pct,
+    qrisk_75pct        = qrisk_75pct,
+    react_75pct        = react_75pct,
+    qrisk_attarget     = qrisk_attarget,
+    react_attarget     = react_attarget,
+    delta_qrisk_100pct = delta_qrisk_100pct,
+    delta_react_100pct = delta_react_100pct,
+    pct_ldl_tgt_dm     = tg_dm[["LDL at target (%)"]],
+    pct_ldl_tgt_ascvd  = tg_asc[["LDL at target (%)"]],
+    gap_ldl_dm         = tg_dm[["Mean LDL gap (mmol/L)"]],
+    gap_ldl_ascvd      = tg_asc[["Mean LDL gap (mmol/L)"]],
+    pct_sbp_tgt_dm     = tg_dm[["SBP at target (%)"]],
+    pct_sbp_tgt_ascvd  = tg_asc[["SBP at target (%)"]],
+    gap_sbp_dm         = tg_dm[["Mean SBP gap (mmHg)"]],
+    gap_sbp_ascvd      = tg_asc[["Mean SBP gap (mmHg)"]],
+    pct_no_llt_dm      = pct_no_llt_dm,
+    pct_high_llt_dm    = pct_high_llt_dm,
+    pct_max_llt_dm     = pct_max_llt_dm,
+    pct_no_llt_ascvd   = pct_no_llt_ascvd,
+    pct_high_llt_ascvd = pct_high_llt_ascvd,
+    pct_max_llt_ascvd  = pct_max_llt_ascvd,
+    pct_no_aht_dm      = pct_no_aht_dm,
+    pct_no_aht_ascvd   = pct_no_aht_ascvd,
+    pct_statin_f_dm    = pct_statin_f_dm,
+    pct_statin_m_dm    = pct_statin_m_dm,
+    pct_statin_f_asc   = pct_statin_f_asc,
+    pct_statin_m_asc   = pct_statin_m_asc,
+    pct_ldl_f_dm       = pct_ldl_f_dm,
+    pct_ldl_m_dm       = pct_ldl_m_dm,
+    pct_ldl_f_asc      = pct_ldl_f_asc,
+    pct_ldl_m_asc      = pct_ldl_m_asc,
+    events_sq_dm_q1        = events_sq_dm_q1,
+    events_sq_dm_q4        = events_sq_dm_q4,
+    events_sq_ascvd_q1     = events_sq_ascvd_q1,
+    events_sq_ascvd_q4     = events_sq_ascvd_q4,
+    prevented_50pct_dm_q4    = prevented_50pct_dm_q4,
+    prevented_50pct_dm_q1    = prevented_50pct_dm_q1,
+    prevented_50pct_ascvd_q4 = prevented_50pct_ascvd_q4,
+    prevented_50pct_ascvd_q1 = prevented_50pct_ascvd_q1,
+    prevented_tgt_dm_q4    = prevented_tgt_dm_q4,
+    prevented_tgt_ascvd_q4 = prevented_tgt_ascvd_q4,
+    qrisk_wimd1         = round(.wv(w_dm,  "qrisk",   1), 1),
+    qrisk_wimd5         = round(.wv(w_dm,  "qrisk",   5), 1),
+    react_wimd1         = round(.wv(w_asc, "react",   1), 1),
+    react_wimd5         = round(.wv(w_asc, "react",   5), 1),
+    pct_ldl_tgt_wimd1_dm    = .wv(w_dm,  "ldl_tgt", 1),
+    pct_ldl_tgt_wimd5_dm    = .wv(w_dm,  "ldl_tgt", 5),
+    pct_ldl_tgt_wimd1_ascvd = .wv(w_asc, "ldl_tgt", 1),
+    pct_ldl_tgt_wimd5_ascvd = .wv(w_asc, "ldl_tgt", 5),
+    pct_sbp_tgt_wimd1   = .wv(w_pool, "sbp_tgt", 1),
+    pct_sbp_tgt_wimd5   = .wv(w_pool, "sbp_tgt", 5),
+    pct_statin_wimd1    = .wv(w_pool, "statin",  1),
+    pct_statin_wimd5    = .wv(w_pool, "statin",  5),
+    pct_aht_wimd1       = .wv(w_pool, "aht",     1),
+    pct_aht_wimd5       = .wv(w_pool, "aht",     5),
+    pct_ldl_tgt_q4_dm   = .qv(dm_q,  "Q4 (highest)", 100*mean(ldl <= 2.0, na.rm=TRUE)),
+    pct_ldl_tgt_q1_dm   = .qv(dm_q,  "Q1 (lowest)",  100*mean(ldl <= 2.0, na.rm=TRUE)),
+    pct_sbp_tgt_q4_dm   = .qv(dm_q,  "Q4 (highest)", 100*mean(sbp <= 130, na.rm=TRUE)),
+    pct_sbp_tgt_q1_dm   = .qv(dm_q,  "Q1 (lowest)",  100*mean(sbp <= 130, na.rm=TRUE)),
+    pct_statin_q4_dm    = .qv(dm_q,  "Q4 (highest)", 100*mean(statin_rx_last6m==1L, na.rm=TRUE)),
+    pct_statin_q4_ascvd = .qv(asc_q, "Q4 (highest)", 100*mean(statin_rx_last6m==1L, na.rm=TRUE)),
+    pct_any_cand_dm     = round(100 * mean(
+      (dm_scored$ldl  > ldl_target_dm    & dm_scored$llt_int < 3L) |
+      (dm_scored$sbp  > sbp_target       & dm_scored$aht_int < 4L),
+      na.rm = TRUE), 1),
+    pct_any_cand_ascvd  = round(100 * mean(
+      (ascvd_scored$ldl > ldl_target_ascvd & ascvd_scored$llt_int < 3L) |
+      (ascvd_scored$sbp > sbp_target       & ascvd_scored$aht_int < 4L),
+      na.rm = TRUE), 1)
+  )
+})
+```
+
+
+**Table 1.** Baseline characteristics
+
+```{r table1, echo=FALSE}
+kbl(baseline_table, align=c("l","c","c","c"),
+    col.names=c("Characteristic","Overall","ASCVD","DM")) |>
+  kable_styling(
+    bootstrap_options=c("striped","hover","condensed"),
+    full_width=FALSE, position="left"
+  ) |>
+  pack_rows("QRISK2-2015 risk factors", 4, 13,
+            bold=TRUE, background="#F0F4FA", color="#2C3E6B") |>
+  pack_rows("REACT risk factors", 14, 23,
+            bold=TRUE, background="#F5F0FA", color="#4B2C6B") |>
+  column_spec(1, width="18em") |>
+  column_spec(2:4, width="8em")
+```
+
+<br>
+<br>
+
+```{r fig1, include=FALSE}
+dm_plot_df    <- dm_scored    |> dplyr::filter(!is.na(qrisk10y))
+ascvd_plot_df <- ascvd_scored |>
+  dplyr::filter(!is.na(react5y)) |>
+  dplyr::mutate(dx_type=dplyr::if_else(hard_event==1L,"MACE diagnosis","Stable diagnosis"))
+
+dm_mean <- mean(dm_plot_df$qrisk10y);    dm_med <- median(dm_plot_df$qrisk10y)
+ascvd_mean <- mean(ascvd_plot_df$react5y); ascvd_med <- median(ascvd_plot_df$react5y)
+
+scen_pal_3 <- c("Status quo"      = "#e66914",
+                "50% at target"  = "#bddd1d",
+                "75% at target"  = "#34aa6f",
+                "100% at target" = "#56026a")
+
+p1a <- ggplot(dm_plot_df, aes(x=qrisk10y)) +
+  geom_density(fill="#4D4D4D", alpha=0.35, linewidth=0.7) +
+  geom_vline(xintercept=dm_med, linewidth=0.7, linetype="longdash") +
+  annotate("text", x=Inf, y=Inf,
+           label=sprintf("Mean %.1f%%\nMedian %.1f%%", dm_mean, dm_med),
+           vjust=1.5, hjust=1.1, size=3.2) +
+  labs(tag="A", title="DM (primary)",
+       x="10-year risk (%)", y="Density") +
+  theme_cap() + theme(plot.tag = element_text(face = "bold", size = 13))
+
+dx_means <- ascvd_plot_df |>
+  dplyr::group_by(dx_type) |>
+  dplyr::summarise(mean_risk   = mean(react5y,   na.rm=TRUE),
+                   median_risk = median(react5y, na.rm=TRUE),
+                   .groups="drop") |>
+  dplyr::mutate(dx_type   = factor(dx_type, levels=names(dx_pal)),
+                lbl       = sprintf("Mean %.1f%%\nMedian %.1f%%", mean_risk, median_risk),
+                vjust_val = (as.integer(factor(dx_type, levels=names(dx_pal))) - 1) * 2.5 + 1.5)
+
+p1b <- ggplot(ascvd_plot_df, aes(x=react5y, colour=dx_type, fill=dx_type)) +
+  geom_density(alpha=0.30, linewidth=0.7) +
+  geom_vline(xintercept=ascvd_med, linewidth=0.7, linetype="longdash") +
+  scale_colour_manual(values=dx_pal, name="Index diagnosis") +
+  scale_fill_manual(values=dx_pal, name="Index diagnosis") +
+  geom_text(data=dx_means,
+            aes(x=Inf, y=Inf, label=lbl, colour=dx_type, vjust=vjust_val),
+            hjust=1.1, size=3.0, lineheight=0.9, show.legend=FALSE) +
+  labs(tag="B", title= "ASCVD (secondary)",
+       x="5-year risk (%)", y="Density") +
+  theme_cap() +
+  theme(legend.position="right", legend.text=element_text(size=8),
+  plot.tag = element_text(face = "bold", size = 13), axis.title.y = element_blank())
+
+# ── Risk distributions under three scenarios ───────────────────────────────────
+# Apply HR-based scenario shifts (no ABM) to produce overlaid distributions
+rr_sbp_dm <- 0.90; rr_ldl_dm <- 0.79
+rr_sbp_ascvd <- 0.80; rr_ldl_ascvd <- 0.78
+
+apply_scenario <- function(dm_s, ascvd_s, cov=NULL) {
+  dm_s2    <- dm_s
+  ascvd_s2 <- ascvd_s
+  if (is.null(cov)) {
+    d_sbp_dm = d_sbp_ascvd = d_ldl_dm = d_ldl_ascvd = 0
+  } else {
+    d_sbp_dm    <- cov * pmax(dm_s$sbp    - sbp_target,       0)
+    d_sbp_ascvd <- cov * pmax(ascvd_s$sbp - sbp_target,       0)
+    d_ldl_dm    <- cov * pmax(dm_s$ldl    - ldl_target_dm,    0)
+    d_ldl_ascvd <- cov * pmax(ascvd_s$ldl - ldl_target_ascvd, 0)
+  }
+  hr_dm    <- rr_sbp_dm^(d_sbp_dm/10)       * rr_ldl_dm^d_ldl_dm
+  hr_ascvd <- rr_sbp_ascvd^(d_sbp_ascvd/10) * rr_ldl_ascvd^d_ldl_ascvd
+  dm_s2$qrisk10y   <- clamp_vec(dm_s$qrisk10y   * hr_dm,    0, 100)
+  ascvd_s2$react5y <- clamp_vec(ascvd_s$react5y * hr_ascvd, 0, 100)
+  list(dm=dm_s2, ascvd=ascvd_s2)
+}
+
+risk_shift_df <- dplyr::bind_rows(
+  { s <- apply_scenario(dm_scored, ascvd_scored)
+    dplyr::bind_rows(
+      dplyr::mutate(s$dm,    scenario="Status quo", cohort="DM"),
+      dplyr::mutate(s$ascvd, scenario="Status quo", cohort="ASCVD"))},
+  { s <- apply_scenario(dm_scored, ascvd_scored, cov=0.50)
+    dplyr::bind_rows(
+      dplyr::mutate(s$dm,    scenario="50% at target", cohort="DM"),
+      dplyr::mutate(s$ascvd, scenario="50% at target", cohort="ASCVD"))},
+  { s <- apply_scenario(dm_scored, ascvd_scored, cov=0.75)
+    dplyr::bind_rows(
+      dplyr::mutate(s$dm,    scenario="75% at target", cohort="DM"),
+      dplyr::mutate(s$ascvd, scenario="75% at target", cohort="ASCVD"))},
+  { s <- apply_scenario(dm_scored, ascvd_scored, cov=1.00)
+    dplyr::bind_rows(
+      dplyr::mutate(s$dm,    scenario="100% at target", cohort="DM"),
+      dplyr::mutate(s$ascvd, scenario="100% at target", cohort="ASCVD"))}
+)
+
+scen_means_dm <- risk_shift_df |>
+  dplyr::filter(cohort=="DM", !is.na(qrisk10y)) |>
+  dplyr::group_by(scenario) |>
+  dplyr::summarise(mean_risk   = mean(qrisk10y,   na.rm=TRUE),
+                   median_risk = median(qrisk10y, na.rm=TRUE),
+                   .groups="drop") |>
+  dplyr::mutate(scenario  = factor(scenario, levels=names(scen_pal_3)),
+                lbl       = sprintf("Mean %.1f%%\nMedian %.1f%%", mean_risk, median_risk),
+                vjust_val = (as.integer(factor(scenario, levels=names(scen_pal_3))) - 1) * 2.5 + 1.5)
+
+scen_means_ascvd <- risk_shift_df |>
+  dplyr::filter(cohort=="ASCVD", !is.na(react5y)) |>
+  dplyr::group_by(scenario) |>
+  dplyr::summarise(mean_risk   = mean(react5y,   na.rm=TRUE),
+                   median_risk = median(react5y, na.rm=TRUE),
+                   .groups="drop") |>
+  dplyr::mutate(scenario  = factor(scenario, levels=names(scen_pal_3)),
+                lbl       = sprintf("Mean %.1f%%\nMedian %.1f%%", mean_risk, median_risk),
+                vjust_val = (as.integer(factor(scenario, levels=names(scen_pal_3))) - 1) * 2.5 + 1.5)
+
+p1c <- risk_shift_df |>
+  dplyr::filter(cohort=="DM", !is.na(qrisk10y)) |>
+  dplyr::mutate(scenario=factor(scenario, levels=names(scen_pal_3))) |>
+  ggplot(aes(x=qrisk10y, colour=scenario, fill=scenario)) +
+  geom_density(alpha=0.30, linewidth=0.7) +
+  geom_vline(data=scen_means_dm,
+             aes(xintercept=mean_risk, colour=scenario),
+             linewidth=0.7, linetype="longdash", show.legend=FALSE) +
+  geom_text(data=scen_means_dm,
+            aes(x=Inf, y=Inf, label=lbl, colour=scenario, vjust=vjust_val),
+            hjust=1.1, size=2.7, lineheight=0.9, show.legend=FALSE) +
+  scale_colour_manual(values=scen_pal_3, name="Scenario") +
+  scale_fill_manual(values=scen_pal_3, name="Scenario") +
+  labs(tag= "A", x="10-year risk (%)", y="Density", title='DM (primary)') +
+  theme_cap() +
+  theme(legend.position="none", plot.tag = element_text(face = "bold", size = 13))
+
+p1d <- risk_shift_df |>
+  dplyr::filter(cohort=="ASCVD", !is.na(react5y)) |>
+  dplyr::mutate(scenario=factor(scenario, levels=names(scen_pal_3))) |>
+  ggplot(aes(x=react5y, colour=scenario, fill=scenario)) +
+  geom_density(alpha=0.30, linewidth=0.7) +
+  geom_vline(data=scen_means_ascvd,
+             aes(xintercept=mean_risk, colour=scenario),
+             linewidth=0.7, linetype="longdash", show.legend=FALSE) +
+  geom_text(data=scen_means_ascvd,
+            aes(x=Inf, y=Inf, label=lbl, colour=scenario, vjust=vjust_val),
+            hjust=1.1, size=2.7, lineheight=0.9, show.legend=FALSE) +
+  scale_colour_manual(values=scen_pal_3, name="Scenario") +
+  scale_fill_manual(values=scen_pal_3, name="Scenario") +
+  labs(tag= "B", x="5-year risk (%)", y="Density", title='ASCVD (secondary)') +
+  theme_cap() +
+  theme(legend.position="right", legend.text=element_text(size=8), plot.tag = element_text(face = "bold", size = 13), axis.title.y = element_blank())
+
+```
+
+<br>
+<br>
+
+```{r fig_biomarkers, fig.width=11, fig.asp=1.1, echo=FALSE}
+# ── Shared data ────────────────────────────────────────────────────────────────
+tg <- treatment_gap
+cohort_pal <- c("DM (primary)"      = "#377EB8",
+                "ASCVD (secondary)" = "#E41A1C")
+
+biomarker_df <- dplyr::bind_rows(
+  dm_base    |> dplyr::mutate(Cohort="DM (primary)"),
+  ascvd_base |> dplyr::mutate(Cohort="ASCVD (secondary)")
+) |>
+  dplyr::mutate(Cohort=factor(Cohort, levels=names(cohort_pal)))
+
+# Summary stats for in-panel annotations - one label per cohort per biomarker
+ann_ldl <- tg |>
+  dplyr::mutate(
+    Cohort = dplyr::recode(Cohort,
+      DM    = "DM (primary)",
+      ASCVD = "ASCVD (secondary)"),
+    label  = sprintf("At target: %s%%\nMean gap: %s mmol/L\nOn LLT: %s%%",
+                     `LDL at target (%)`, `Mean LDL gap (mmol/L)`, `On LLT (%)`)
+  ) |>
+  dplyr::select(Cohort, label)
+
+ann_sbp <- tg |>
+  dplyr::mutate(
+    Cohort = dplyr::recode(Cohort,
+      DM    = "DM (primary)",
+      ASCVD = "ASCVD (secondary)"),
+    label  = sprintf("At target: %s%%\nMean gap: %s mmHg\nOn AHT: %s%%",
+                     `SBP at target (%)`, `Mean SBP gap (mmHg)`, `On AHT (%)`)
+  ) |>
+  dplyr::select(Cohort, label)
+
+# x positions for staggered annotation labels (avoid overlap)
+ann_ldl$x_pos  <- c(6.5, 5.5)   # adjust if needed once rendered
+ann_sbp$x_pos  <- c(185, 200)
+
+# ── Panel A: LDL-C both cohorts on one plot ────────────────────────────────────
+pBio_A <- ggplot(dplyr::filter(biomarker_df, !is.na(ldl)),
+             aes(x=ldl, colour=Cohort, fill=Cohort)) +
+  geom_density(alpha=0.22, linewidth=0.75) +
+  geom_vline(xintercept=ldl_target_dm,    linetype="dashed", linewidth=0.7,
+             colour=cohort_pal[["DM (primary)"]]) +
+  geom_vline(xintercept=ldl_target_ascvd, linetype="dotted", linewidth=0.7,
+             colour=cohort_pal[["ASCVD (secondary)"]]) +
+  annotate("text", x=ldl_target_dm+0.07,    y=Inf, vjust=1.6, hjust=0,
+           label="2.0 mmol/L",    size=2.5,
+           colour=cohort_pal[["DM (primary)"]]) +
+  annotate("text", x=ldl_target_ascvd-0.07, y=Inf, vjust=1.6, hjust=1,
+           label="1.8 mmol/L",  size=2.5,
+           colour=cohort_pal[["ASCVD (secondary)"]]) +
+  scale_colour_manual(values=cohort_pal, name="Cohort") +
+  scale_fill_manual(values=cohort_pal,   name="Cohort") +
+  labs(tag="C", title='Lipids',
+       x="LDL-C (mmol/L)", y="Density") +
+  coord_cartesian(xlim = c(NA, 7.5)) +
+  theme_cap() +
+  theme(legend.position="none",
+        plot.tag=element_text(face="bold", size=13))
+
+# ── Panel B: SBP both cohorts on one plot ─────────────────────────────────────
+pBio_B <- ggplot(dplyr::filter(biomarker_df, !is.na(sbp)),
+             aes(x=sbp, colour=Cohort, fill=Cohort)) +
+  geom_density(alpha=0.22, linewidth=0.75) +
+  geom_vline(xintercept=sbp_target, linetype="dashed", linewidth=0.8,
+             colour="#333333") +
+  annotate("text", x=sbp_target+1, y=Inf, vjust=1.6, hjust=0,
+           label="≤130 mmHg", size=2.5, colour="#333333") +
+  scale_colour_manual(values=cohort_pal, name="Cohort") +
+  scale_fill_manual(values=cohort_pal,   name="Cohort") +
+  labs(tag="D", title='Blood pressure',
+       x="SBP (mmHg)", y="Density") +
+  theme_cap() +
+  theme(legend.position="right", axis.title.y = element_blank(),
+        plot.tag=element_text(face="bold", size=13))
+
+# ── Panels C & D: treatment intensity bars ────────────────────────────────────
+combined_lbl_map <- c(
+  "No treatment"        = "No treatment",
+  "Other treatment"     = "Other LLT / 1 class",
+  "LI statin"           = "LI statin / 2 classes",
+  "HI statin"           = "HI statin / 3 classes",
+  "Combination therapy" = "Combination LLT / 4 classes",
+  "1 drug class"        = "Other LLT / 1 class",
+  "2 classes"           = "LI statin / 2 classes",
+  "3 classes"           = "HI statin / 3 classes",
+  "4 classes"           = "Combination LLT / 4 classes"
+)
+combined_pal <- c(
+  "No treatment"                = "#e66914",
+  "Other LLT / 1 class"         = "#bddd1d",
+  "LI statin / 2 classes"       = "#34aa6f",
+  "HI statin / 3 classes"       = "#4d5ca9",
+  "Combination LLT / 4 classes" = "#56026a"
+)
+
+tr_clean <- treatment_rates |>
+  dplyr::mutate(
+    Label  = factor(
+      dplyr::recode(as.character(Label), !!!combined_lbl_map),
+      levels = rev(names(combined_pal))
+    ),
+    Cohort = factor(Cohort,
+                    levels=c("DM (primary)",
+                             "ASCVD (secondary)"))
+  )
+
+pBio_C <- ggplot(dplyr::filter(tr_clean, Treatment=="LLT"),
+             aes(x=Cohort, y=Pct, fill=Label)) +
+  geom_col(width=0.55, colour="white", linewidth=0.2) +
+  scale_fill_manual(values=combined_pal, drop=FALSE) +
+  scale_y_continuous(labels=scales::label_percent(scale=1), limits=c(0,100),
+                     expand=expansion(mult=c(0,0.04))) +
+  labs(tag="E", x='Cohort', y="Proportion") +
+  theme_cap() +
+  theme(axis.text.x=element_text(size=8.5),
+        legend.text=element_text(size=8),
+        legend.position="none",
+        plot.tag=element_text(face="bold", size=13))
+
+pBio_D <- ggplot(dplyr::filter(tr_clean, Treatment=="AHT"),
+             aes(x=Cohort, y=Pct, fill=Label)) +
+  geom_col(width=0.55, colour="white", linewidth=0.2) +
+  scale_fill_manual(values=combined_pal, drop=FALSE, name="LLT / AHT") +
+  scale_y_continuous(labels=scales::label_percent(scale=1), limits=c(0,100),
+                     expand=expansion(mult=c(0,0.04))) +
+  labs(tag="F", x='Cohort', y=NULL) +
+  guides(fill=guide_legend(nrow=5)) +
+  theme_cap() +
+  theme(axis.text.x=element_text(size=8.5),
+        legend.text=element_text(size=8),
+        legend.position="right",
+        plot.tag=element_text(face="bold", size=13))
+
+# ── Compose 3×2 ───────────────────────────────────────────────────────────────
+fig1 <- (p1a | p1b) / (pBio_A | pBio_B) / (pBio_C | pBio_D) +
+  plot_layout(heights=c(1, 1, 1.05))
+fig1
+ggsave("figures/fig1.tiff", fig1, width = 11, height = 11 * 1.1, dpi = 300, compression = "lzw")
+```
+
+**Figure 1.** Estimated cardiovascular risk distributions and baseline treatment status. **(A)** QRISK2 10-year risk, DM (primary prevention). **(B)** REACT 5-year risk, ASCVD (secondary prevention). **(C)** LDL-C distributions; guideline targets (2.0 mmol/L DM, 1.8 mmol/L ASCVD). **(D)** SBP distributions; guideline target 130 mmHg. **(E)** Baseline lipid-lowering therapy. **(F)** Baseline antihypertensive therapy.
+
+
+<br>
+<br>
+
+
+**Table 2.** Biomarker target scenarios - projected risk factor levels, target attainment, and cardiovascular risk by coverage level (Δ = absolute change from baseline; 95% CI from published relative risk bounds).
+
+```{r table2, echo=FALSE}
+tbl2 <- biomarker_table[, !names(biomarker_table) %in% "biomarker"]
+bio_seq   <- rle(biomarker_table$biomarker)
+start_idx <- cumsum(c(1, bio_seq$lengths[-length(bio_seq$lengths)]))
+end_idx   <- cumsum(bio_seq$lengths)
+
+k <- kbl(tbl2,
+    digits=1, escape=FALSE,
+    align=c("l","r","r","r","l","r","r","r","l"),
+    col.names=c("Scenario",
+                "Mean<br><small>(Δ from baseline)</small>",
+                "At target (%)",
+                "Projected QRISK2 (%)<br><small>(Δ from baseline)</small>",
+                "95% CI",
+                "Mean<br><small>(Δ from baseline)</small>",
+                "At target (%)",
+                "Projected REACT (%)<br><small>(Δ from baseline)</small>",
+                "95% CI")) |>
+  kable_styling(bootstrap_options=c("striped","hover","condensed"),
+                full_width=FALSE, position="left") |>
+  add_header_above(c(" "=1, "DM (primary)"=4, "ASCVD (secondary)"=4),
+                   bold=TRUE, background="#F0F0F0") |>
+  column_spec(1, width="12em") |>
+  column_spec(c(2,3,6,7), width="8em") |>
+  column_spec(4, width="8em", color="#2C3E6B", bold=TRUE) |>
+  column_spec(5, width="7em", color="#2C3E6B", border_right=TRUE) |>
+  column_spec(8, width="8em", color="#2C3E6B", bold=TRUE) |>
+  column_spec(9, width="7em", color="#2C3E6B")
+
+for (i in seq_along(bio_seq$values)) {
+  bg <- if (bio_seq$values[i] == "LDL-C (mmol/L)") "#EEF4FB" else "#F5F0FA"
+  col <- if (bio_seq$values[i] == "LDL-C (mmol/L)") "#2C3E6B" else "#4B2C6B"
+  k <- pack_rows(k, bio_seq$values[i], start_idx[i], end_idx[i],
+                 bold=TRUE, background=bg, color=col)
+}
+k
+```
+
+<br>
+<br>
+
+```{r fig_opportunity, fig.width=11, fig.asp=1.0, echo=FALSE}
+# Shared quartile helpers (also used by Supplementary Figure 2)
+q_base <- c("Q1 (lowest)","Q2","Q3","Q4 (highest)")
+.q_range_labels <- function(brks, base = q_base) setNames(c(
+  sprintf("%s\n(<%.1f%%)",       base[1], brks[2]),
+  sprintf("%s\n(%.1f–%.1f%%)",   base[2], brks[2], brks[3]),
+  sprintf("%s\n(%.1f–%.1f%%)",   base[3], brks[3], brks[4]),
+  sprintf("%s\n(>%.1f%%)",       base[4], brks[4])
+), base)
+
+# ── Per-patient setup ────────────────────────────────────────────────────────
+opp3_q_dm    <- quantile(dm_scored$qrisk10y,  c(0,.25,.5,.75,1), na.rm=TRUE)
+opp3_q_ascvd <- quantile(ascvd_scored$react5y, c(0,.25,.5,.75,1), na.rm=TRUE)
+
+dm_opp3 <- dm_scored |>
+  dplyr::filter(!is.na(qrisk10y), !is.na(sbp), !is.na(ldl)) |>
+  dplyr::mutate(
+    risk5y = 1 - (1 - qrisk10y/100)^0.5,
+    risk_q = cut(qrisk10y, breaks=opp3_q_dm, labels=q_base, include.lowest=TRUE)
+  )
+
+ascvd_opp3 <- ascvd_scored |>
+  dplyr::filter(!is.na(react5y), !is.na(sbp), !is.na(ldl)) |>
+  dplyr::mutate(
+    risk5y = react5y / 100,
+    risk_q = cut(react5y, breaks=opp3_q_ascvd, labels=q_base, include.lowest=TRUE)
+  )
+
+# ── RR point estimates and 95% CI bounds ──────────────────────────────────
+# SBP: Ettehad 2016 (Lancet) subgroup estimates
+# LDL: CTT diabetes 2008 (Lancet) for DM; CTT 2010 (Lancet) for ASCVD
+rr_dm <- list(
+  central = c(sbp=0.90, ldl=0.79),
+  pessim  = c(sbp=0.95, ldl=0.86),  # upper 95% CI - smallest effect
+  optimis = c(sbp=0.84, ldl=0.72)   # lower 95% CI - largest effect
+)
+rr_ascvd <- list(
+  central = c(sbp=0.80, ldl=0.78),
+  pessim  = c(sbp=0.83, ldl=0.80),
+  optimis = c(sbp=0.77, ldl=0.76)
+)
+
+.make_opp3_rr <- function(df, cohort_nm, rr, ldl_tgt) {
+  .ep_cov <- function(cov) {
+    df |> dplyr::filter(!is.na(risk_q)) |>
+      dplyr::mutate(hr_c = rr["sbp"]^(cov*pmax(sbp-sbp_target,0)/10) *
+                           rr["ldl"]^(cov*pmax(ldl-ldl_tgt,0))) |>
+      dplyr::group_by(risk_q) |>
+      dplyr::summarise(events_expected  = mean(risk5y * hr_c, na.rm=TRUE) * 1000,
+                       events_prevented = mean(risk5y * (1 - hr_c), na.rm=TRUE) * 1000,
+                       .groups="drop")
+  }
+  dplyr::bind_rows(
+    df |> dplyr::filter(!is.na(risk_q)) |>
+      dplyr::group_by(risk_q) |>
+      dplyr::summarise(events_expected=mean(risk5y,na.rm=TRUE)*1000,
+                       events_prevented=0, .groups="drop") |>
+      dplyr::mutate(scenario="Status quo"),
+    .ep_cov(0.50) |> dplyr::mutate(scenario="50% at target"),
+    .ep_cov(0.75) |> dplyr::mutate(scenario="75% at target"),
+    .ep_cov(1.00) |> dplyr::mutate(scenario="100% at target")
+  ) |> dplyr::mutate(Cohort = cohort_nm)
+}
+
+opp3_df <- dplyr::bind_rows(
+  .make_opp3_rr(dm_opp3,    "DM (primary)",      rr_dm$central,    ldl_target_dm)    |> dplyr::mutate(bound="central"),
+  .make_opp3_rr(dm_opp3,    "DM (primary)",      rr_dm$pessim,     ldl_target_dm)    |> dplyr::mutate(bound="pessim"),
+  .make_opp3_rr(dm_opp3,    "DM (primary)",      rr_dm$optimis,    ldl_target_dm)    |> dplyr::mutate(bound="optimis"),
+  .make_opp3_rr(ascvd_opp3, "ASCVD (secondary)", rr_ascvd$central, ldl_target_ascvd) |> dplyr::mutate(bound="central"),
+  .make_opp3_rr(ascvd_opp3, "ASCVD (secondary)", rr_ascvd$pessim,  ldl_target_ascvd) |> dplyr::mutate(bound="pessim"),
+  .make_opp3_rr(ascvd_opp3, "ASCVD (secondary)", rr_ascvd$optimis, ldl_target_ascvd) |> dplyr::mutate(bound="optimis")
+) |>
+  dplyr::mutate(
+    scenario = factor(scenario, levels=names(scen_pal_3)),
+    risk_q   = factor(risk_q,   levels=q_base),
+    Cohort   = factor(Cohort,   levels=c("DM (primary)","ASCVD (secondary)"))
+  )
+
+# Quartile range labels
+dm_qlbls3    <- .q_range_labels(opp3_q_dm)
+ascvd_qlbls3 <- .q_range_labels(opp3_q_ascvd)
+
+opp3_df <- opp3_df |>
+  dplyr::mutate(
+    risk_q_lbl = dplyr::if_else(
+      Cohort == "DM (primary)",
+      dm_qlbls3[as.character(risk_q)],
+      ascvd_qlbls3[as.character(risk_q)]
+    ),
+    risk_q_lbl = factor(risk_q_lbl, levels=unique(c(dm_qlbls3, ascvd_qlbls3)))
+  )
+
+# Central estimate: used for bar panels, labels, and baseline
+opp3_central <- opp3_df |> dplyr::filter(bound == "central")
+
+opp3_base <- opp3_central |>
+  dplyr::filter(scenario == "Status quo") |>
+  dplyr::select(risk_q, Cohort, baseline = events_expected)
+
+opp3_plot <- opp3_central |>
+  dplyr::left_join(opp3_base, by=c("risk_q","Cohort"))
+
+# RR uncertainty envelope for line panels (non-status-quo scenarios only)
+# pessim  (upper CI of RR) → smallest effect → most events remain → ev_hi
+# optimis (lower CI of RR) → largest effect  → fewest events remain → ev_lo
+opp3_bounds_wide <- opp3_df |>
+  dplyr::filter(bound != "central", scenario != "Status quo") |>
+  dplyr::select(risk_q, risk_q_lbl, Cohort, scenario, bound, events_expected) |>
+  tidyr::pivot_wider(names_from = bound, values_from = events_expected) |>
+  dplyr::rename(ev_lo = optimis, ev_hi = pessim)
+
+# ── Fixed y-axis limits (shared across cohort panels within each row) ─────
+y_lim_line <- c(0, max(opp3_plot$baseline, na.rm = TRUE) * 1.08)
+y_lim_bar  <- c(0, opp3_central |>
+                     dplyr::filter(scenario == "100% at target") |>
+                     dplyr::pull(events_prevented) |>
+                     max(na.rm = TRUE) * 1.1)
+
+# ── Panel function: line plots (A, B) ─────────────────────────────────────
+.line_panel <- function(cohort_nm, q_lbls) {
+  d <- opp3_plot |>
+    dplyr::filter(Cohort == cohort_nm) |>
+    dplyr::mutate(risk_q_lbl = factor(as.character(risk_q_lbl), levels = q_lbls))
+  d_rib <- opp3_bounds_wide |>
+    dplyr::filter(Cohort == cohort_nm) |>
+    dplyr::mutate(risk_q_lbl = factor(as.character(risk_q_lbl), levels = q_lbls))
+  ggplot(d, aes(x = risk_q_lbl, group = scenario)) +
+    geom_ribbon(data = d_rib,
+                aes(ymin = ev_lo, ymax = ev_hi, fill = scenario, group = scenario),
+                alpha = 0.18, show.legend = FALSE) +
+    geom_line(aes(y = events_expected, colour = scenario), linewidth = 1.1) +
+    geom_point(aes(y = events_expected, colour = scenario, shape = scenario), size = 3.2) +
+    scale_colour_manual(values = scen_pal_3, name = "Scenario") +
+    scale_fill_manual(values = scen_pal_3) +
+    scale_shape_manual(values = c("Status quo"=16, "50% at target"=17,
+                                  "75% at target"=18, "100% at target"=15),
+                       name = "Scenario") +
+    scale_y_continuous(limits = y_lim_line, expand = expansion(mult = c(0, 0))) +
+    labs(x = "Baseline risk quartile",
+         y = "Events expected (per 1,000)",
+         title = NULL) +
+    theme_cap() +
+    theme(legend.text = element_text(size = 9),
+          axis.text.x = element_text(size = 8),
+          axis.title.x = element_blank())
+}
+
+pOpp_A <- .line_panel("DM (primary)",      unname(dm_qlbls3)) + theme(legend.position = 'none') +
+      labs(tag = "C") + theme(plot.tag = element_text(face = "bold", size = 13))
+pOpp_B <- .line_panel("ASCVD (secondary)", unname(ascvd_qlbls3)) + theme(legend.position = 'right', axis.title.y = element_blank()) +
+      labs(tag = "D") + theme(plot.tag = element_text(face = "bold", size = 13))
+
+# ── Stacked bar data (C, D) ────────────────────────────────────────────────
+bar_pal <- c("50% at target"               = "#bddd1d",
+             "75% at target (additional)"  = "#34aa6f",
+             "100% at target (additional)" = "#56026a")
+
+opp3_stacked <- opp3_central |>
+  dplyr::filter(scenario != "Status quo") |>
+  dplyr::select(risk_q, risk_q_lbl, Cohort, scenario, events_prevented) |>
+  tidyr::pivot_wider(names_from = scenario, values_from = events_prevented) |>
+  dplyr::mutate(
+    ep_50  = `50% at target`,
+    ep_75m = `75% at target`  - `50% at target`,
+    ep_100m= `100% at target` - `75% at target`
+  ) |>
+  dplyr::select(risk_q, risk_q_lbl, Cohort, ep_50, ep_75m, ep_100m) |>
+  tidyr::pivot_longer(c(ep_50, ep_75m, ep_100m),
+                      names_to = "component", values_to = "events") |>
+  dplyr::mutate(component = factor(component,
+    levels = c("ep_100m","ep_75m","ep_50"),
+    labels = c("100% at target (additional)","75% at target (additional)","50% at target")))
+
+# Error bars on total bar height (100% at target events prevented across RR bounds)
+# pessim  → upper CI of RR → fewest events prevented → err_lo
+# optimis → lower CI of RR → most events prevented  → err_hi
+opp3_bar_err <- opp3_df |>
+  dplyr::filter(scenario == "100% at target") |>
+  dplyr::select(risk_q, risk_q_lbl, Cohort, bound, events_prevented) |>
+  tidyr::pivot_wider(names_from = bound, values_from = events_prevented) |>
+  dplyr::rename(err_lo = pessim, err_hi = optimis)
+
+.bar_panel <- function(cohort_nm, q_lbls) {
+  d <- opp3_stacked |>
+    dplyr::filter(Cohort == cohort_nm) |>
+    dplyr::mutate(risk_q_lbl = factor(as.character(risk_q_lbl), levels = q_lbls))
+  d_err <- opp3_bar_err |>
+    dplyr::filter(Cohort == cohort_nm) |>
+    dplyr::mutate(risk_q_lbl = factor(as.character(risk_q_lbl), levels = q_lbls))
+  ggplot(d, aes(x = risk_q_lbl, y = events, fill = component)) +
+    geom_col(width = 0.6) +
+    geom_errorbar(data = d_err,
+                  aes(x = risk_q_lbl, ymin = err_lo, ymax = err_hi),
+                  inherit.aes = FALSE,
+                  width = 0.25, linewidth = 0.6, colour = "#e66914") +
+    scale_fill_manual(values = bar_pal, name = "Scenario") +
+    scale_y_continuous(limits = y_lim_bar, expand = expansion(mult = c(0, 0))) +
+    labs(x = "Baseline risk quartile",
+         y = "Events prevented (per 1,000)") +
+    theme_cap() +
+    theme(legend.text = element_text(size = 9),
+          axis.text.x = element_text(size = 8))
+}
+
+pOpp_C <- .bar_panel("DM (primary)",      unname(dm_qlbls3)) + theme(legend.position = 'none') +
+      labs(tag = "E") + theme(plot.tag = element_text(face = "bold", size = 13))
+pOpp_D <- .bar_panel("ASCVD (secondary)", unname(ascvd_qlbls3)) + theme(legend.position = 'right', axis.title.y = element_blank()) +
+      labs(tag = "F") + theme(plot.tag = element_text(face = "bold", size = 13))
+
+# ── Compose 3 × 2 ─────────────────────────────────────────────────────────
+fig2 <- (p1c | p1d) / (pOpp_A | pOpp_B) / (pOpp_C | pOpp_D) +
+  plot_layout(heights=c(1, 1, 1.05))
+fig2
+ggsave("figures/fig2.tiff", fig2, width = 11, height = 11 * 1.0, dpi = 300, compression = "lzw")
+```
+
+**Figure 2.** Population-level cardiovascular risk distributions under modelled coverage scenarios and estimated event burden by risk quartile (individual patient gaps scaled by coverage). **(A)** QRISK2 distributions under scenarios. **(B)** REACT distributions under scenarios. **(C, D)** Expected five-year events per 1,000 patients by scenario (shaded ribbons denote 95% CI of published relative risk estimates). **(E, F)** Events prevented per 1,000 patients by scenario decomposed into incremental coverage gains (error bars denote 95% CI of published relative risk estimates for 100% at target).
+
+
+<br>
+<br>
+
+```{r candidates_data, echo=FALSE}
+# Quartile break points and range labels (mirrors .q_range_labels in fig_opportunity)
+.cq_base   <- c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+.cq_brks_dm    <- quantile(dm_scored$qrisk10y,  c(0, .25, .5, .75, 1), na.rm = TRUE)
+.cq_brks_ascvd <- quantile(ascvd_scored$react5y, c(0, .25, .5, .75, 1), na.rm = TRUE)
+
+.mk_cq_lbls <- function(brks, base = .cq_base) setNames(c(
+  sprintf("%s\n(<%.1f%%)",     base[1], brks[2]),
+  sprintf("%s\n(%.1f–%.1f%%)", base[2], brks[2], brks[3]),
+  sprintf("%s\n(%.1f–%.1f%%)", base[3], brks[3], brks[4]),
+  sprintf("%s\n(>%.1f%%)",     base[4], brks[4])
+), base)
+
+cq_labs_dm    <- .mk_cq_lbls(.cq_brks_dm)
+cq_labs_ascvd <- .mk_cq_lbls(.cq_brks_ascvd)
+
+# Flag each patient by LDL and SBP treatment status
+dm_cand <- dm_scored |>
+  dplyr::filter(!is.na(qrisk10y), !is.na(ldl), !is.na(sbp)) |>
+  dplyr::mutate(
+    risk_q     = cut(qrisk10y, breaks = .cq_brks_dm,
+                     labels = .cq_base, include.lowest = TRUE),
+    risk_q_lbl = factor(cq_labs_dm[as.character(risk_q)],
+                        levels = unname(cq_labs_dm)),
+    risk5y = 1 - (1 - qrisk10y / 100)^0.5,
+    ldl_status = dplyr::case_when(
+      llt_int == 0     & ldl <= ldl_target_dm ~ "NC: No LLT, at target",
+      llt_int %in% 1:2 & ldl <= ldl_target_dm ~ "NC: LI LLT, at target",
+      llt_int >= 3     & ldl <= ldl_target_dm ~ "NC: HI LLT, at target",
+      llt_int == 0     & ldl >  ldl_target_dm ~ "C: No LLT, not at target",
+      llt_int %in% 1:2 & ldl >  ldl_target_dm ~ "C: LI LLT, not at target",
+      llt_int >= 3     & ldl >  ldl_target_dm ~ "NC: HI LLT, not at target"
+    ),
+    sbp_status = dplyr::case_when(
+      sbp <= sbp_target                    ~ "NC: At target",
+      aht_int %in% 1:3 & sbp > sbp_target ~ "C: 1-3 agents, above target",
+      aht_int == 4     & sbp > sbp_target ~ "NC: 4 agents, above target",
+      aht_int == 0     & sbp > sbp_target ~ "C: No AHT, above target"
+    ),
+    ldl_cand = ldl > ldl_target_dm    & llt_int < 3,
+    sbp_cand = sbp > sbp_target       & aht_int < 4,
+    any_cand = ldl_cand | sbp_cand
+  )
+
+ascvd_cand <- ascvd_scored |>
+  dplyr::filter(!is.na(react5y), !is.na(ldl), !is.na(sbp)) |>
+  dplyr::mutate(
+    risk_q     = cut(react5y, breaks = .cq_brks_ascvd,
+                     labels = .cq_base, include.lowest = TRUE),
+    risk_q_lbl = factor(cq_labs_ascvd[as.character(risk_q)],
+                        levels = unname(cq_labs_ascvd)),
+    risk5y = react5y / 100,
+    ldl_status = dplyr::case_when(
+      llt_int == 0     & ldl <= ldl_target_ascvd ~ "NC: No LLT, at target",
+      llt_int %in% 1:2 & ldl <= ldl_target_ascvd ~ "NC: LI LLT, at target",
+      llt_int >= 3     & ldl <= ldl_target_ascvd ~ "NC: HI LLT, at target",
+      llt_int == 0     & ldl >  ldl_target_ascvd ~ "C: No LLT, not at target",
+      llt_int %in% 1:2 & ldl >  ldl_target_ascvd ~ "C: LI LLT, not at target",
+      llt_int >= 3     & ldl >  ldl_target_ascvd ~ "NC: HI LLT, not at target"
+    ),
+    sbp_status = dplyr::case_when(
+      sbp <= sbp_target                    ~ "NC: At target",
+      aht_int %in% 1:3 & sbp > sbp_target ~ "C: 1-3 agents, above target",
+      aht_int == 4     & sbp > sbp_target ~ "NC: 4 agents, above target",
+      aht_int == 0     & sbp > sbp_target ~ "C: No AHT, above target"
+    ),
+    ldl_cand = ldl > ldl_target_ascvd & llt_int < 3,
+    sbp_cand = sbp > sbp_target       & aht_int < 4,
+    any_cand = ldl_cand | sbp_cand
+  )
+
+# RR bounds - same values as fig_opportunity
+.rr_cand <- list(
+  DM    = list(central = c(sbp=0.90, ldl=0.79),
+               pessim  = c(sbp=0.95, ldl=0.86),
+               optimis = c(sbp=0.84, ldl=0.72)),
+  ASCVD = list(central = c(sbp=0.80, ldl=0.78),
+               pessim  = c(sbp=0.83, ldl=0.80),
+               optimis = c(sbp=0.77, ldl=0.76))
+)
+
+# Events prevented per 1,000 candidates using patient-specific deltas to reach target
+.cand_ep <- function(df, cohort, rr) {
+  ldl_tgt <- if (cohort == "DM") ldl_target_dm else ldl_target_ascvd
+  df |>
+    dplyr::filter(any_cand, !is.na(risk_q)) |>
+    dplyr::mutate(
+      d_ldl = dplyr::if_else(ldl_cand, pmax(ldl - ldl_tgt, 0), 0),
+      d_sbp = dplyr::if_else(sbp_cand, pmax(sbp - 130, 0), 0),
+      hr    = rr["sbp"]^(d_sbp / 10) * rr["ldl"]^d_ldl,
+      ep    = risk5y * (1 - hr)
+    ) |>
+    dplyr::group_by(risk_q, risk_q_lbl) |>
+    dplyr::summarise(
+      n_cand   = dplyr::n(),
+      ep_per1k = mean(ep, na.rm = TRUE) * 1000,
+      .groups  = "drop"
+    ) |>
+    dplyr::mutate(Cohort = if (cohort == "DM") "DM (primary)" else "ASCVD (secondary)")
+}
+
+# Compute all bounds and pivot to wide for error bars
+cand_ep_wide <- dplyr::bind_rows(
+  .cand_ep(dm_cand,    "DM",    .rr_cand$DM$central)    |> dplyr::mutate(bound = "central"),
+  .cand_ep(dm_cand,    "DM",    .rr_cand$DM$pessim)     |> dplyr::mutate(bound = "pessim"),
+  .cand_ep(dm_cand,    "DM",    .rr_cand$DM$optimis)    |> dplyr::mutate(bound = "optimis"),
+  .cand_ep(ascvd_cand, "ASCVD", .rr_cand$ASCVD$central) |> dplyr::mutate(bound = "central"),
+  .cand_ep(ascvd_cand, "ASCVD", .rr_cand$ASCVD$pessim)  |> dplyr::mutate(bound = "pessim"),
+  .cand_ep(ascvd_cand, "ASCVD", .rr_cand$ASCVD$optimis) |> dplyr::mutate(bound = "optimis")
+) |>
+  tidyr::pivot_wider(
+    id_cols     = c(risk_q, risk_q_lbl, Cohort, n_cand),
+    names_from  = bound,
+    values_from = ep_per1k
+  ) |>
+  dplyr::rename(ep_per1k = central, err_lo = pessim, err_hi = optimis)
+
+cand_ep_dm    <- dplyr::filter(cand_ep_wide, Cohort == "DM (primary)")
+cand_ep_ascvd <- dplyr::filter(cand_ep_wide, Cohort == "ASCVD (secondary)")
+
+# Scenario 1: only treatment-naïve candidates (llt_int == 0 / aht_int == 0) are
+# initiated on high-intensity statin (~1.0 mmol/L LDL reduction) and standard
+# first-line antihypertensive (~10 mmHg SBP reduction), capped at patient gap.
+# Undertreated patients contribute zero delta in this scenario.
+.cand_ep_initiated <- function(df, cohort, rr,
+                                d_ldl_init = 1.0, d_sbp_init = 10) {
+  ldl_tgt <- if (cohort == "DM") ldl_target_dm else ldl_target_ascvd
+  df |>
+    dplyr::filter(any_cand, !is.na(risk_q)) |>
+    dplyr::mutate(
+      d_ldl = dplyr::if_else(ldl_cand & llt_int == 0,
+                             pmin(pmax(ldl - ldl_tgt, 0), d_ldl_init), 0),
+      d_sbp = dplyr::if_else(sbp_cand & aht_int == 0,
+                             pmin(pmax(sbp - 130,    0), d_sbp_init), 0),
+      hr    = rr["sbp"]^(d_sbp / 10) * rr["ldl"]^d_ldl,
+      ep    = risk5y * (1 - hr)
+    ) |>
+    dplyr::group_by(risk_q, risk_q_lbl) |>
+    dplyr::summarise(ep_per1k = mean(ep, na.rm = TRUE) * 1000, .groups = "drop") |>
+    dplyr::mutate(Cohort = if (cohort == "DM") "DM (primary)" else "ASCVD (secondary)")
+}
+
+cand_scen <- dplyr::bind_rows(
+  .cand_ep_initiated(dm_cand,    "DM",    .rr_cand$DM$central)    |>
+    dplyr::mutate(Scenario = "All candidates treated"),
+  .cand_ep_initiated(ascvd_cand, "ASCVD", .rr_cand$ASCVD$central) |>
+    dplyr::mutate(Scenario = "All candidates treated"),
+  cand_ep_wide |>
+    dplyr::select(risk_q, risk_q_lbl, Cohort, ep_per1k) |>
+    dplyr::mutate(Scenario = "Candidates reach target")
+) |>
+  dplyr::mutate(Scenario = factor(Scenario,
+    levels = c("All candidates treated", "Candidates reach target")))
+
+cand_scen_pal <- c(
+  "All candidates treated" = "#bddd1d",
+  "Candidates reach target"    = "#34aa6f"
+)
+
+cand_scen_dm    <- dplyr::filter(cand_scen, Cohort == "DM (primary)")
+cand_scen_ascvd <- dplyr::filter(cand_scen, Cohort == "ASCVD (secondary)")
+
+# Stacked bar data for E/F: bottom = "All candidates treated", top = marginal
+# Mirrors figure 3 C/D stacking logic
+cand_stacked <- cand_scen |>
+  dplyr::select(risk_q, risk_q_lbl, Cohort, ep_per1k, Scenario) |>
+  tidyr::pivot_wider(names_from = Scenario, values_from = ep_per1k) |>
+  dplyr::mutate(marginal_ep = `Candidates reach target` - `All candidates treated`) |>
+  dplyr::select(-`Candidates reach target`) |>
+  dplyr::rename(initiated_ep = `All candidates treated`) |>
+  tidyr::pivot_longer(c(initiated_ep, marginal_ep),
+                      names_to = "component", values_to = "ep_per1k") |>
+  dplyr::mutate(component = factor(component,
+    levels = c("marginal_ep", "initiated_ep"),
+    labels = c("Additional to target", "All candidates treated")))
+
+cand_stacked_dm    <- dplyr::filter(cand_stacked, Cohort == "DM (primary)")
+cand_stacked_ascvd <- dplyr::filter(cand_stacked, Cohort == "ASCVD (secondary)")
+
+cand_bar_pal <- c(
+  "All candidates treated" = "#bddd1d",
+  "Additional to target"   = "#56026a"
+)
+
+# CI bounds for "All candidates treated" (treatment-naive initiated only)
+cand_init_wide <- dplyr::bind_rows(
+  .cand_ep_initiated(dm_cand,    "DM",    .rr_cand$DM$pessim)    |> dplyr::mutate(bound = "pessim"),
+  .cand_ep_initiated(dm_cand,    "DM",    .rr_cand$DM$optimis)   |> dplyr::mutate(bound = "optimis"),
+  .cand_ep_initiated(ascvd_cand, "ASCVD", .rr_cand$ASCVD$pessim) |> dplyr::mutate(bound = "pessim"),
+  .cand_ep_initiated(ascvd_cand, "ASCVD", .rr_cand$ASCVD$optimis)|> dplyr::mutate(bound = "optimis")
+) |>
+  tidyr::pivot_wider(id_cols = c(risk_q, risk_q_lbl, Cohort),
+                     names_from = bound, values_from = ep_per1k) |>
+  dplyr::rename(err_lo = pessim, err_hi = optimis)
+cand_init_dm    <- dplyr::filter(cand_init_wide, Cohort == "DM (primary)")
+cand_init_ascvd <- dplyr::filter(cand_init_wide, Cohort == "ASCVD (secondary)")
+
+# Inline scalars
+.p2 <- function(x) round(100 * mean(x, na.rm = TRUE), 1)
+
+pct_any_cand_dm       <- .p2(dm_cand$any_cand)
+pct_ldl_cand_dm       <- .p2(dm_cand$ldl_cand)
+pct_sbp_cand_dm       <- .p2(dm_cand$sbp_cand)
+pct_any_cand_ascvd    <- .p2(ascvd_cand$any_cand)
+pct_ldl_cand_ascvd    <- .p2(ascvd_cand$ldl_cand)
+pct_sbp_cand_ascvd    <- .p2(ascvd_cand$sbp_cand)
+
+ep_cand_dm_q1    <- round(cand_ep_dm$ep_per1k[cand_ep_dm$risk_q == "Q1 (lowest)"], 1)
+ep_cand_dm_q4    <- round(cand_ep_dm$ep_per1k[cand_ep_dm$risk_q == "Q4 (highest)"], 1)
+ep_cand_ascvd_q1 <- round(cand_ep_ascvd$ep_per1k[cand_ep_ascvd$risk_q == "Q1 (lowest)"], 1)
+ep_cand_ascvd_q4 <- round(cand_ep_ascvd$ep_per1k[cand_ep_ascvd$risk_q == "Q4 (highest)"], 1)
+```
+
+```{r fig_candidates, fig.width=8, fig.asp=1, echo=FALSE}
+ldl_pal    <- c("NC: No LLT, at target"     = "#a8d5b8",
+                "NC: LI LLT, at target"     = "#d5edcf",
+                "NC: HI LLT, at target"     = "#b8d8eb",
+                "NC: HI LLT, not at target" = "#8fafc8",
+                "C: LI LLT, not at target"     = "#fdae61",
+                "C: No LLT, not at target"     = "#d73027")
+ldl_levels <- c("NC: HI LLT, at target","NC: HI LLT, not at target",
+                "NC: No LLT, at target","NC: LI LLT, at target",
+                "C: LI LLT, not at target","C: No LLT, not at target")
+
+sbp_pal    <- c("NC: At target"               = "#a8d5b8",
+                "C: 1-3 agents, above target"    = "#fdae61",
+                "NC: 4 agents, above target"  = "#8fafc8",
+                "C: No AHT, above target"        = "#d73027")
+sbp_levels <- c("NC: 4 agents, above target","NC: At target",
+                "C: 1-3 agents, above target","C: No AHT, above target")
+.cq_col4    <- c("#2171B5", "#6BAED6", "#F16913", "#CB181D")
+
+# Build a named colour palette from a labelled quartile vector
+.cq_pal_named <- function(q_lbls) setNames(.cq_col4, unname(q_lbls))
+
+.ldl_status_q <- function(df, cohort_nm) {
+  df |>
+    dplyr::filter(!is.na(risk_q_lbl), !is.na(ldl_status)) |>
+    dplyr::mutate(ldl_status = factor(ldl_status, levels = ldl_levels)) |>
+    dplyr::count(risk_q_lbl, ldl_status, .drop = FALSE) |>
+    dplyr::group_by(risk_q_lbl) |>
+    dplyr::mutate(pct = 100 * n / sum(n)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(Cohort = cohort_nm)
+}
+
+ldl_status_dm    <- .ldl_status_q(dm_cand,    "DM (primary)")
+ldl_status_ascvd <- .ldl_status_q(ascvd_cand, "ASCVD (secondary)")
+
+.sbp_status_q <- function(df, cohort_nm) {
+  df |>
+    dplyr::filter(!is.na(risk_q_lbl), !is.na(sbp_status)) |>
+    dplyr::mutate(sbp_status = factor(sbp_status, levels = sbp_levels)) |>
+    dplyr::count(risk_q_lbl, sbp_status, .drop = FALSE) |>
+    dplyr::group_by(risk_q_lbl) |>
+    dplyr::mutate(pct = 100 * n / sum(n)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(Cohort = cohort_nm)
+}
+
+sbp_status_dm    <- .sbp_status_q(dm_cand,    "DM (primary)")
+sbp_status_ascvd <- .sbp_status_q(ascvd_cand, "ASCVD (secondary)")
+
+.ldl_bar <- function(d, q_lbls, tag, title_nm, show_legend = FALSE) {
+  p <- ggplot(d, aes(x = risk_q_lbl, y = pct, fill = ldl_status)) +
+    geom_col(width = 0.7) +
+    scale_fill_manual(values = ldl_pal, drop = FALSE) +
+    scale_x_discrete(limits = unname(q_lbls)) +
+    scale_y_continuous(limits = c(0, 101), expand = expansion(mult = c(0, 0))) +
+    labs(tag = tag, title = title_nm, x = NULL, y = "Proportion (%)") +
+    theme_cap() +
+    theme(plot.tag = element_text(face = "bold", size = 13),
+          axis.text.x = element_text(size = 7.5))
+  if (!show_legend) p + theme(legend.position = "none") else p
+}
+
+.sbp_bar <- function(d, q_lbls, tag, title_nm, show_legend = FALSE) {
+  p <- ggplot(d, aes(x = risk_q_lbl, y = pct, fill = sbp_status)) +
+    geom_col(width = 0.7) +
+    scale_fill_manual(values = sbp_pal, drop = FALSE) +
+    scale_x_discrete(limits = unname(q_lbls)) +
+    scale_y_continuous(limits = c(0, 101), expand = expansion(mult = c(0, 0))) +
+    labs(tag = tag, title = title_nm, x = NULL, y = "Proportion (%)") +
+    theme_cap() +
+    theme(plot.tag = element_text(face = "bold", size = 13),
+          axis.text.x = element_text(size = 7.5))
+  if (!show_legend) p + theme(legend.position = "none") else p
+}
+
+pC_A <- .ldl_bar(ldl_status_dm,    cq_labs_dm,    "A", "DM (primary)")
+pC_B <- .ldl_bar(ldl_status_ascvd, cq_labs_ascvd, "B", "ASCVD (secondary)", show_legend = TRUE) +
+  theme(axis.title.y = element_blank(), legend.position = "right") +
+  labs(fill = 'LDL-C')
+pC_C <- .sbp_bar(sbp_status_dm,    cq_labs_dm,    "C", NULL)
+pC_D <- .sbp_bar(sbp_status_ascvd, cq_labs_ascvd, "D", NULL, show_legend = TRUE) +
+  theme(axis.title.y = element_blank(), legend.position = "right") +
+  labs(fill = 'Blood pressure')
+
+# Events prevented per 1,000 candidates: stacked bars + error bars matching fig3 C/D
+# Bottom = "All candidates treated" (untreated initiated), top = marginal to target
+# Error bars span 95% CI of total "Candidates reach target" estimate
+.ep_bar <- function(stacked_df, ep_df, q_lbls, tag, show_y = TRUE, init_df = NULL) {
+  ymax <- ceiling(max(ep_df$err_hi, na.rm = TRUE) * 1.15)
+
+  d <- stacked_df |>
+    dplyr::mutate(risk_q_lbl = factor(risk_q_lbl, levels = unname(q_lbls)))
+  d_err <- ep_df |>
+    dplyr::mutate(risk_q_lbl = factor(risk_q_lbl, levels = unname(q_lbls)))
+
+  p <- ggplot(d, aes(x = risk_q_lbl, y = ep_per1k, fill = component)) +
+    geom_col(width = 0.6) +
+    geom_errorbar(data = d_err,
+                  aes(x = risk_q_lbl, ymin = err_lo, ymax = err_hi),
+                  inherit.aes = FALSE,
+                  width = 0.25, linewidth = 0.6, colour = "#e66914") +
+    scale_fill_manual(values = cand_bar_pal, name = "Scenario") +
+    scale_x_discrete(limits = unname(q_lbls)) +
+    scale_y_continuous(limits = c(0, ymax), expand = expansion(mult = c(0, 0))) +
+    labs(tag = tag,
+         x = "Baseline risk quartile",
+         y = "Events prevented (per 1,000)") +
+    theme_cap() +
+    theme(plot.tag = element_text(face = "bold", size = 13),
+          axis.text.x = element_text(size = 7.5))
+
+  if (!is.null(init_df)) {
+    d_init <- init_df |>
+      dplyr::mutate(risk_q_lbl = factor(risk_q_lbl, levels = unname(q_lbls)))
+    p <- p + geom_errorbar(data = d_init,
+                           aes(x = risk_q_lbl, ymin = err_lo, ymax = err_hi),
+                           inherit.aes = FALSE,
+                           width = 0.18, linewidth = 0.6, colour = "#e66914")
+  }
+
+  if (!show_y) p + theme(axis.title.y = element_blank(), legend.position = "none")
+  else p + theme(legend.position = "right",
+                 legend.text = element_text(size = 8),
+                 legend.key.height = unit(2, "lines"))
+}
+
+pC_E <- .ep_bar(cand_stacked_dm,    cand_ep_dm,    cq_labs_dm,    "E", show_y = TRUE)  + theme(legend.position = "none")
+pC_F <- .ep_bar(cand_stacked_ascvd, cand_ep_ascvd, cq_labs_ascvd, "F", show_y = FALSE) + theme(legend.position = "right")
+
+fig3 <- (pC_A | pC_B) / (pC_C | pC_D) / (pC_E | pC_F) +
+  plot_layout(heights = c(1, 1, 1))
+fig3
+ggsave("figures/fig3.tiff", fig3, width = 11, height = 11 * 1.1, dpi = 300, compression = "lzw")
+```
+
+**Figure 3.** LDL-C and blood pressure treatment status by baseline risk quartile and projected prevention opportunity. **(A, B)** LDL-C treatment status by LLT use and target attainment. **(C, D)** SBP treatment status by antihypertensive agent count and target attainment. **(E, F)** Projected five-year events prevented per 1,000 candidates using patient-specific risk factor gaps (error bars denote 95% CI of published relative risk estimates).
+
+
+<br>
+<br>
+
+```{r interact_data, echo=FALSE}
+q_ix_dm    <- quantile(dm_scored$qrisk10y,   probs = c(0,.25,.5,.75,1), na.rm = TRUE)
+q_ix_ascvd <- quantile(ascvd_scored$react5y, probs = c(0,.25,.5,.75,1), na.rm = TRUE)
+q_labs_ix  <- c("Q1 (lowest)","Q2","Q3","Q4 (highest)")
+wimd_labs_ix <- c("1 (most\ndeprived)","2","3","4","5 (least\ndeprived)")
+
+ix_dm <- dm_scored |>
+  dplyr::filter(!is.na(wimd), wimd %in% 1:5, !is.na(qrisk10y)) |>
+  dplyr::mutate(
+    risk_q = cut(qrisk10y, breaks = q_ix_dm,    labels = q_labs_ix, include.lowest = TRUE),
+    wimd_f = factor(wimd, levels = 1:5, labels = wimd_labs_ix)
+  )
+ix_ascvd <- ascvd_scored |>
+  dplyr::filter(!is.na(wimd), wimd %in% 1:5, !is.na(react5y)) |>
+  dplyr::mutate(
+    risk_q = cut(react5y, breaks = q_ix_ascvd, labels = q_labs_ix, include.lowest = TRUE),
+    wimd_f = factor(wimd, levels = 1:5, labels = wimd_labs_ix)
+  )
+
+ix_sum <- dplyr::bind_rows(
+  ix_dm |>
+    dplyr::filter(!is.na(risk_q)) |>
+    dplyr::group_by(wimd_f, risk_q) |>
+    dplyr::summarise(
+      pct_ldl_target       = 100 * mean(ldl <= 2.0,                     na.rm = TRUE),
+      pct_on_statin        = 100 * mean(statin_rx_last6m == 1L,         na.rm = TRUE),
+      pct_sbp_target       = 100 * mean(sbp <= 130,                     na.rm = TRUE),
+      pct_on_aht           = 100 * mean(treated_htn == 1L,              na.rm = TRUE),
+      pct_ldl_untreated    = 100 * mean(ldl > 2.0 & llt_int == 0,       na.rm = TRUE),
+      pct_ldl_undertreated = 100 * mean(ldl > 2.0 & llt_int %in% 1:3,  na.rm = TRUE),
+      pct_sbp_untreated    = 100 * mean(sbp > 130  & aht_int == 0,      na.rm = TRUE),
+      pct_sbp_undertreated = 100 * mean(sbp > 130  & aht_int %in% 1:3, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "DM (primary)"),
+  ix_ascvd |>
+    dplyr::filter(!is.na(risk_q)) |>
+    dplyr::group_by(wimd_f, risk_q) |>
+    dplyr::summarise(
+      pct_ldl_target       = 100 * mean(ldl <= 1.8,                     na.rm = TRUE),
+      pct_on_statin        = 100 * mean(statin_rx_last6m == 1L,         na.rm = TRUE),
+      pct_sbp_target       = 100 * mean(sbp <= 130,                     na.rm = TRUE),
+      pct_on_aht           = 100 * mean(treated_htn == 1L,              na.rm = TRUE),
+      pct_ldl_untreated    = 100 * mean(ldl > 1.8 & llt_int == 0,       na.rm = TRUE),
+      pct_ldl_undertreated = 100 * mean(ldl > 1.8 & llt_int %in% 1:3,  na.rm = TRUE),
+      pct_sbp_untreated    = 100 * mean(sbp > 130  & aht_int == 0,      na.rm = TRUE),
+      pct_sbp_undertreated = 100 * mean(sbp > 130  & aht_int %in% 1:3, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+
+.ixv <- function(co, wq, rq, mt)
+  round(ix_sum[[mt]][ix_sum$Cohort == co &
+                     as.character(ix_sum$wimd_f) == wq &
+                     as.character(ix_sum$risk_q) == rq], 1)
+pct_ldl_q4w1_dm  <- .ixv("DM (primary)",      "1 (most\ndeprived)",  "Q4 (highest)", "pct_ldl_target")
+pct_ldl_q4w5_dm  <- .ixv("DM (primary)",      "5 (least\ndeprived)", "Q4 (highest)", "pct_ldl_target")
+pct_ldl_q4w1_asc <- .ixv("ASCVD (secondary)", "1 (most\ndeprived)",  "Q4 (highest)", "pct_ldl_target")
+pct_ldl_q4w5_asc <- .ixv("ASCVD (secondary)", "5 (least\ndeprived)", "Q4 (highest)", "pct_ldl_target")
+```
+
+```{r fig_interact, include=FALSE}
+# ── Colour limits: data range across both cohorts per metric, with 2 pp padding
+ldl_lims <- range(ix_sum$pct_ldl_target, na.rm = TRUE) + c(-2, 2)
+stn_lims <- range(ix_sum$pct_on_statin,  na.rm = TRUE) + c(-2, 2)
+sbp_lims <- range(ix_sum$pct_sbp_target, na.rm = TRUE) + c(-2, 2)
+aht_lims <- range(ix_sum$pct_on_aht,     na.rm = TRUE) + c(-2, 2)
+
+# ── Heatmap panel function ─────────────────────────────────────────────────
+.heat_panel <- function(dat, cohort_nm, metric_col, fill_label, tag,
+                        limits, show_legend = FALSE) {
+  d <- dat |>
+    dplyr::filter(Cohort == cohort_nm, !is.na(risk_q)) |>
+    dplyr::mutate(risk_q = factor(as.character(risk_q), levels = rev(q_labs_ix)))
+  p <- ggplot(d, aes(x = wimd_f, y = risk_q, fill = .data[[metric_col]])) +
+    geom_tile(colour = "white", linewidth = 0.6) +
+    geom_text(aes(label = sprintf("%.0f%%", .data[[metric_col]])),
+              size = 2.8, colour = "white", fontface = "bold") +
+    scale_fill_gradient(low = "#CB181D", high = "#2171B5",
+                        limits = limits, name = fill_label,
+                        labels = scales::label_percent(scale = 1)) +
+    labs(tag = tag, title = NULL,
+         x = NULL, y = NULL) +
+    theme_cap() +
+    theme(plot.tag    = element_text(face = "bold", size = 13),
+          axis.text.x = element_text(size = 8))
+  if (show_legend) p + theme(legend.position = "right")
+  else             p + theme(legend.position = "none")
+}
+
+pIA <- .heat_panel(ix_sum, "DM (primary)",      "pct_ldl_target", "LDL-C\nat target (%)", "A", ldl_lims) + labs(title='DM (primary)', y = "Baseline risk quartile") + theme(axis.text.x = element_blank())
+pIB <- .heat_panel(ix_sum, "ASCVD (secondary)", "pct_ldl_target", "LDL-C\nat target (%)", "B", ldl_lims, show_legend = TRUE) + labs(title='ASCVD (secondary)') + theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+pIC <- .heat_panel(ix_sum, "DM (primary)",      "pct_on_statin",  "On statin\n(%)",        "C", stn_lims) + labs(y = "Baseline risk quartile") + theme(axis.text.x = element_blank())
+pID <- .heat_panel(ix_sum, "ASCVD (secondary)", "pct_on_statin",  "On statin\n(%)",        "D", stn_lims, show_legend = TRUE) + theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+pIE <- .heat_panel(ix_sum, "DM (primary)",      "pct_sbp_target", "SBP\nat target (%)",    "E", sbp_lims) + labs(y = "Baseline risk quartile") + theme(axis.text.x = element_blank())
+pIF <- .heat_panel(ix_sum, "ASCVD (secondary)", "pct_sbp_target", "SBP\nat target (%)",    "F", sbp_lims, show_legend = TRUE) + theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+pIG <- .heat_panel(ix_sum, "DM (primary)",      "pct_on_aht",     "On AHT\n(%)",           "G", aht_lims) + labs(y = "Baseline risk quartile", x = "WIMD quintile")
+pIH <- .heat_panel(ix_sum, "ASCVD (secondary)", "pct_on_aht",     "On AHT\n(%)",           "H", aht_lims, show_legend = TRUE) + labs(x = "WIMD quintile") + theme(axis.text.y = element_blank())
+
+fig8 <- (pIA | pIB) / (pIC | pID) / (pIE | pIF) / (pIG | pIH)
+fig8
+ggsave("figures/fig8.tiff", fig8, width = 11, height = 11 * 1.65, dpi = 300, compression = "lzw")
+```
+
+<br>
+<br>
+
+```{r suppl_table1, echo=FALSE}
+# Classify candidates as untreated vs undertreated
+# Untreated: at least one contributing condition has intensity 0
+# Undertreated: all contributing conditions have intensity 1-3
+dm_cand_tbl <- dm_cand |>
+  dplyr::filter(any_cand) |>
+  dplyr::mutate(
+    tx_status = dplyr::if_else(
+      (ldl_cand & llt_int == 0) | (sbp_cand & aht_int == 0),
+      "Untreated", "Undertreated"
+    )
+  )
+
+ascvd_cand_tbl <- ascvd_cand |>
+  dplyr::filter(any_cand) |>
+  dplyr::mutate(
+    tx_status = dplyr::if_else(
+      (ldl_cand & llt_int == 0) | (sbp_cand & aht_int == 0),
+      "Untreated", "Undertreated"
+    )
+  )
+
+pct  <- function(x) sprintf("%d (%.1f%%)", sum(x, na.rm = TRUE), 100 * mean(x, na.rm = TRUE))
+mn   <- function(x) sprintf("%.1f (%.1f)",  mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+mn2  <- function(x) sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+
+summ_cand <- function(df, is_dm = TRUE) {
+  vt <- function(val) if (is_dm) "-" else pct(df$vascular_territory == val)
+  list(
+    "N"                               = nrow(df),
+    "Age"                             = mn(df$age),
+    "Male"                            = pct(df$sex == "M"),
+    "Statin in last 6m"               = pct(df$statin_rx_last6m),
+    "Systolic blood pressure"         = mn(df$sbp),
+    "LDL-C"                           = mn2(df$ldl),
+    "Body Mass Index"                 = mn(df$bmi),
+    "WIMD quintile 1 (most deprived)" = pct(df$wimd == 1L),
+    "Hypertension (treated)"          = pct(df$treated_htn),
+    "Atrial fibrillation"             = pct(df$af),
+    "CKD stage 3–5"                   = pct(df$ckd),
+    "Heart failure"                   = pct(df$hf),
+    "IHD"                             = vt("IHD"),
+    "Stroke"                          = vt("Stroke"),
+    "PAD"                             = vt("PAD"),
+    "LDL candidate"                   = pct(df$ldl_cand),
+    "SBP candidate"                   = pct(df$sbp_cand)
+  )
+}
+
+all_cand_tbl <- dplyr::bind_rows(dm_cand_tbl, ascvd_cand_tbl)
+
+ov_u  <- summ_cand(dplyr::filter(all_cand_tbl,  tx_status == "Untreated"),    is_dm = FALSE)
+ov_ut <- summ_cand(dplyr::filter(all_cand_tbl,  tx_status == "Undertreated"), is_dm = FALSE)
+dm_u  <- summ_cand(dplyr::filter(dm_cand_tbl,   tx_status == "Untreated"),    is_dm = TRUE)
+dm_ut <- summ_cand(dplyr::filter(dm_cand_tbl,   tx_status == "Undertreated"), is_dm = TRUE)
+ax_u  <- summ_cand(dplyr::filter(ascvd_cand_tbl, tx_status == "Untreated"),   is_dm = FALSE)
+ax_ut <- summ_cand(dplyr::filter(ascvd_cand_tbl, tx_status == "Undertreated"), is_dm = FALSE)
+
+cand_tbl <- data.frame(
+  Characteristic  = names(ov_u),
+  OV_Untreated    = unlist(ov_u),
+  OV_Undertreated = unlist(ov_ut),
+  DM_Untreated    = unlist(dm_u),
+  DM_Undertreated = unlist(dm_ut),
+  AX_Untreated    = unlist(ax_u),
+  AX_Undertreated = unlist(ax_ut),
+  stringsAsFactors = FALSE, row.names = NULL
+)
+
+kbl(cand_tbl, align = c("l","c","c","c","c","c","c"),
+    col.names = c("Characteristic",
+                  "Untreated", "Undertreated",
+                  "Untreated", "Undertreated",
+                  "Untreated", "Undertreated")) |>
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE, position = "left"
+  ) |>
+  add_header_above(c(" " = 1,
+                     "Overall" = 2,
+                     "DM (primary)" = 2,
+                     "ASCVD (secondary)" = 2)) |>
+  column_spec(1, width = "16em") |>
+  column_spec(2:7, width = "7em")
+```
+
+**Supplementary Table 1.** Baseline characteristics of actionable treatment candidates by treatment status.
+
+<br>
+<br>
+
+```{r suppl_table2, echo=FALSE}
+wimd_lvls  <- 1:5
+wimd_hdrs  <- c("1 (most deprived)", "2", "3", "4", "5 (least deprived)")
+
+# Build one summary column per cohort × WIMD quintile
+ax_wimd <- lapply(wimd_lvls, function(w)
+  summ_cand(dplyr::filter(ascvd_cand_tbl, wimd == w), is_dm = FALSE))
+dm_wimd <- lapply(wimd_lvls, function(w)
+  summ_cand(dplyr::filter(dm_cand_tbl, wimd == w), is_dm = TRUE))
+
+wimd_tbl <- data.frame(
+  Characteristic = names(ax_wimd[[1]]),
+  setNames(lapply(ax_wimd, unlist), paste0("AX_W", wimd_lvls)),
+  setNames(lapply(dm_wimd, unlist), paste0("DM_W", wimd_lvls)),
+  stringsAsFactors = FALSE, row.names = NULL
+)
+
+kbl(wimd_tbl,
+    align  = c("l", rep("c", 10)),
+    col.names = c("Characteristic", wimd_hdrs, wimd_hdrs)) |>
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE, position = "left"
+  ) |>
+  add_header_above(c(" " = 1,
+                     "ASCVD (secondary)" = 5,
+                     "DM (primary)"      = 5)) |>
+  column_spec(1, width = "15em") |>
+  column_spec(2:11, width = "6em")
+```
+
+**Supplementary Table 2.** Baseline characteristics of actionable treatment candidates by WIMD quintile. 
+
+<br>
+<br>
+
+```{r suppl_table3, echo=FALSE}
+rq_lvls <- c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+rq_hdrs <- c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+
+ax_rq <- lapply(rq_lvls, function(q)
+  summ_cand(dplyr::filter(ascvd_cand_tbl, risk_q == q), is_dm = FALSE))
+dm_rq <- lapply(rq_lvls, function(q)
+  summ_cand(dplyr::filter(dm_cand_tbl,   risk_q == q), is_dm = TRUE))
+
+rq_tbl <- data.frame(
+  Characteristic = names(ax_rq[[1]]),
+  setNames(lapply(ax_rq, unlist), paste0("AX_", rq_lvls)),
+  setNames(lapply(dm_rq,  unlist), paste0("DM_", rq_lvls)),
+  stringsAsFactors = FALSE, row.names = NULL
+)
+
+kbl(rq_tbl,
+    align  = c("l", rep("c", 8)),
+    col.names = c("Characteristic", rq_hdrs, rq_hdrs)) |>
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE, position = "left"
+  ) |>
+  add_header_above(c(" " = 1,
+                     "ASCVD (secondary)" = 4,
+                     "DM (primary)"      = 4)) |>
+  column_spec(1, width = "15em") |>
+  column_spec(2:9, width = "7em")
+```
+
+**Supplementary Table 3.** Baseline characteristics of actionable treatment candidates by baseline cardiovascular risk quartile.
+
+<br>
+<br>
+
+```{r fig_wimd, include=FALSE}
+wimd_labels <- c("1 (most\ndeprived)", "2", "3", "4", "5 (least\ndeprived)")
+wimd_pal    <- setNames(
+  c("#D62728", "#FF7F0E", "#9467BD", "#17BECF", "#2CA02C"),
+  wimd_labels
+)
+
+dm_wimd    <- dm_scored    |>
+  dplyr::filter(!is.na(wimd), wimd %in% 1:5) |>
+  dplyr::mutate(wimd_f = factor(wimd, levels = 1:5, labels = wimd_labels))
+ascvd_wimd <- ascvd_scored |>
+  dplyr::filter(!is.na(wimd), wimd %in% 1:5) |>
+  dplyr::mutate(wimd_f = factor(wimd, levels = 1:5, labels = wimd_labels))
+
+# ── Summary statistics by WIMD ─────────────────────────────────────────────────
+wimd_sum <- dplyr::bind_rows(
+  dm_wimd |>
+    dplyr::group_by(wimd_f) |>
+    dplyr::summarise(
+      pct_ldl_target = 100 * mean(ldl <= 2.0,             na.rm = TRUE),
+      pct_sbp_target = 100 * mean(sbp <= 130,             na.rm = TRUE),
+      pct_on_statin  = 100 * mean(statin_rx_last6m == 1L, na.rm = TRUE),
+      pct_on_aht     = 100 * mean(treated_htn == 1L,      na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "DM (primary)"),
+  ascvd_wimd |>
+    dplyr::group_by(wimd_f) |>
+    dplyr::summarise(
+      pct_ldl_target = 100 * mean(ldl <= 1.8,             na.rm = TRUE),
+      pct_sbp_target = 100 * mean(sbp <= 130,             na.rm = TRUE),
+      pct_on_statin  = 100 * mean(statin_rx_last6m == 1L, na.rm = TRUE),
+      pct_on_aht     = 100 * mean(treated_htn == 1L,      na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+
+# ── Panel A: QRISK2 by WIMD (DM) ──────────────────────────────────────────────
+pWA <- ggplot(dm_wimd |> dplyr::filter(!is.na(qrisk10y)),
+              aes(x = qrisk10y, colour = wimd_f, fill = wimd_f)) +
+  geom_density(alpha = 0.18, linewidth = 0.65) +
+  scale_colour_manual(values = wimd_pal, name = "WIMD quintile") +
+  scale_fill_manual(  values = wimd_pal, name = "WIMD quintile") +
+  labs(tag = "A", title= "DM (primary)",
+       x = "10-year risk (%)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "none", plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panel B: REACT by WIMD (ASCVD) ────────────────────────────────────────────
+pWB <- ggplot(ascvd_wimd |> dplyr::filter(!is.na(react5y)),
+              aes(x = react5y, colour = wimd_f, fill = wimd_f)) +
+  geom_density(alpha = 0.18, linewidth = 0.65) +
+  scale_colour_manual(values = wimd_pal, name = "WIMD quintile") +
+  scale_fill_manual(  values = wimd_pal, name = "WIMD quintile") +
+  labs(tag = "B", title = "ASCVD (secondary)",
+       x = "5-year risk (%)", y = "Density") +
+  theme_cap() +
+  theme(axis.title.y = element_blank(), legend.position = "right", plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panels C/D: all 4 metrics by WIMD, split by cohort ────────────────────────
+wimd_all_long <- wimd_sum |>
+  tidyr::pivot_longer(
+    cols     = c(pct_ldl_target, pct_on_statin, pct_sbp_target, pct_on_aht),
+    names_to = "Metric", values_to = "Pct"
+  ) |>
+  dplyr::mutate(
+    Metric = factor(Metric,
+                    levels = c("pct_ldl_target", "pct_on_statin",
+                               "pct_sbp_target", "pct_on_aht"),
+                    labels = c("At LDL target", "On LLT",
+                               "At SBP target", "On AHT"))
+  )
+
+.metric_lbl_ldl <- "At LDL target\n(<2.0 / <1.8 mmol/L)"
+.metric_lbl_sbp <- "At SBP target\n(≤130 mmHg)"
+.metric_pal <- c(setNames("#CB181D", .metric_lbl_ldl), "On LLT" = "#FC9272",
+                 setNames("#2171B5", .metric_lbl_sbp), "On AHT" = "#9ECAE1")
+.metric_shp <- c(setNames(16, .metric_lbl_ldl), "On LLT" = 17,
+                 setNames(15, .metric_lbl_sbp), "On AHT" = 18)
+.metric_lvls <- c(.metric_lbl_ldl, "On LLT", .metric_lbl_sbp, "On AHT")
+
+.recode_metric <- function(dat) {
+  dat |> dplyr::mutate(
+    Metric = factor(
+      dplyr::recode(as.character(Metric),
+                    "At LDL target" = .metric_lbl_ldl,
+                    "At SBP target" = .metric_lbl_sbp),
+      levels = .metric_lvls
+    )
+  )
+}
+
+.make_wimd_all <- function(dat, tag, show_legend = FALSE) {
+  dat <- .recode_metric(dat)
+  p <- ggplot(dat, aes(x = wimd_f, y = Pct,
+                       colour = Metric, group = Metric, shape = Metric)) +
+    geom_line(linewidth = 1.0) +
+    geom_point(size = 3.2) +
+    scale_colour_manual(values = .metric_pal, name = "Metric") +
+    scale_shape_manual(values  = .metric_shp, name = "Metric") +
+    scale_y_continuous(labels = scales::label_percent(scale = 1),
+                       limits = c(0, 100),
+                       expand = expansion(mult = c(0.02, 0.14))) +
+    labs(tag = tag, x = "WIMD quintile", y = "Proportion") +
+    guides(colour = guide_legend(nrow = 4), shape = guide_legend(nrow = 4)) +
+    theme_cap() +
+    theme(legend.text       = element_text(size = 8),
+          legend.key.width  = unit(1.8, "lines"),
+          legend.key.height = unit(2.2, "lines"),
+          plot.tag          = element_text(face = "bold", size = 13))
+  if (show_legend) p + theme(legend.position = "right")
+  else             p + theme(legend.position = "none")
+}
+
+pWC <- .make_wimd_all(
+  wimd_all_long |> dplyr::filter(Cohort == "DM (primary)"),   "C"
+)
+pWD <- .make_wimd_all(
+  wimd_all_long |> dplyr::filter(Cohort == "ASCVD (secondary)"), "D", show_legend = TRUE
+) + theme(axis.title.y = element_blank())
+
+fig5 <- (pWA | pWB) / (pWC | pWD) +
+  plot_layout(heights = c(1.2, 1))
+fig5
+ggsave("figures/fig5.tiff", fig5, width = 11, height = 11 * 0.75, dpi = 300, compression = "lzw")
+```
+
+<br>
+<br>
+
+```{r suppl_fig1, fig.width=11, fig.asp=0.75, echo=FALSE}
+fig5
+```
+
+**Supplementary Figure 1.** Estimated cardiovascular risk and risk factor control by WIMD quintile. (A) QRISK2 risk, DM cohort. (B) REACT risk, ASCVD cohort. (C–D) LDL-C and SBP target attainment and treatment receipt.
+
+<br>
+<br>
+
+```{r fig_riskq, include=FALSE}
+q_pal <- c("#2171B5", "#6BAED6", "#F16913", "#CB181D")
+
+q_dm_breaks    <- quantile(dm_scored$qrisk10y,  probs = c(0, .25, .5, .75, 1), na.rm = TRUE)
+q_ascvd_breaks <- quantile(ascvd_scored$react5y, probs = c(0, .25, .5, .75, 1), na.rm = TRUE)
+q_labs         <- c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+q_labs_dm      <- .q_range_labels(q_dm_breaks)
+q_labs_ascvd   <- .q_range_labels(q_ascvd_breaks)
+
+dm_q    <- dm_scored |>
+  dplyr::filter(!is.na(qrisk10y)) |>
+  dplyr::mutate(risk_q = cut(qrisk10y,  breaks = q_dm_breaks,
+                              labels = q_labs_dm, include.lowest = TRUE))
+ascvd_q <- ascvd_scored |>
+  dplyr::filter(!is.na(react5y)) |>
+  dplyr::mutate(risk_q = cut(react5y, breaks = q_ascvd_breaks,
+                               labels = q_labs_ascvd, include.lowest = TRUE))
+
+# ── Quartile-level summaries ───────────────────────────────────────────────────
+rq_sum <- dplyr::bind_rows(
+  dm_q |>
+    dplyr::group_by(risk_q) |>
+    dplyr::summarise(
+      pct_ldl_target = 100 * mean(ldl <= 2.0,             na.rm = TRUE),
+      pct_sbp_target = 100 * mean(sbp <= 130,             na.rm = TRUE),
+      pct_on_statin  = 100 * mean(statin_rx_last6m == 1L, na.rm = TRUE),
+      pct_on_aht     = 100 * mean(treated_htn == 1L,      na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "DM (primary)"),
+  ascvd_q |>
+    dplyr::group_by(risk_q) |>
+    dplyr::summarise(
+      pct_ldl_target = 100 * mean(ldl <= 1.8,             na.rm = TRUE),
+      pct_sbp_target = 100 * mean(sbp <= 130,             na.rm = TRUE),
+      pct_on_statin  = 100 * mean(statin_rx_last6m == 1L, na.rm = TRUE),
+      pct_on_aht     = 100 * mean(treated_htn == 1L,      na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "ASCVD (secondary)")
+) |>
+  dplyr::filter(!is.na(risk_q))
+
+# ── Panel A: LDL-C by risk quartile (DM) ──────────────────────────────────────
+pQA <- ggplot(dm_q |> dplyr::filter(!is.na(ldl), !is.na(risk_q)),
+              aes(x = ldl, colour = risk_q, fill = risk_q)) +
+  geom_density(alpha = 0.20, linewidth = 0.7) +
+  geom_vline(xintercept = 2.0, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 2.07, y = Inf, vjust = 1.8, hjust = 0,
+           label = "2.0 mmol/L", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = q_pal, name = "Risk quartile") +
+  scale_fill_manual(  values = q_pal, name = "Risk quartile") +
+  labs(tag = "A", title = "DM (primary)",
+       x = "LDL-C (mmol/L)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "none", plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panel B: LDL-C by risk quartile (ASCVD) ───────────────────────────────────
+pQB <- ggplot(ascvd_q |> dplyr::filter(!is.na(ldl), !is.na(risk_q)),
+              aes(x = ldl, colour = risk_q, fill = risk_q)) +
+  geom_density(alpha = 0.20, linewidth = 0.7) +
+  geom_vline(xintercept = 1.8, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 1.87, y = Inf, vjust = 1.8, hjust = 0,
+           label = "1.8 mmol/L", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = q_pal, name = "Risk quartile") +
+  scale_fill_manual(  values = q_pal, name = "Risk quartile") +
+  labs(tag = "B", title = "ASCVD (secondary)",
+       x = "LDL-C (mmol/L)", y = "Density") +
+  theme_cap() +
+  theme(axis.title.y = element_blank(), legend.position = "right", legend.key.height = unit(2.2, "lines"),
+        plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panel C: SBP by risk quartile (DM) ────────────────────────────────────────
+pQC <- ggplot(dm_q |> dplyr::filter(!is.na(sbp), !is.na(risk_q)),
+              aes(x = sbp, colour = risk_q, fill = risk_q)) +
+  geom_density(alpha = 0.20, linewidth = 0.7) +
+  geom_vline(xintercept = 130, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 131, y = Inf, vjust = 1.8, hjust = 0,
+           label = "≤130 mmHg", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = q_pal, name = "Risk quartile") +
+  scale_fill_manual(  values = q_pal, name = "Risk quartile") +
+  labs(tag = "C",
+       x = "SBP (mmHg)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "none", plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panel D: SBP by risk quartile (ASCVD) ─────────────────────────────────────
+pQD <- ggplot(ascvd_q |> dplyr::filter(!is.na(sbp), !is.na(risk_q)),
+              aes(x = sbp, colour = risk_q, fill = risk_q)) +
+  geom_density(alpha = 0.20, linewidth = 0.7) +
+  geom_vline(xintercept = 130, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 131, y = Inf, vjust = 1.8, hjust = 0,
+           label = "≤130 mmHg", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = q_pal, name = "Risk quartile") +
+  scale_fill_manual(  values = q_pal, name = "Risk quartile") +
+  labs(tag = "D", 
+       x = "SBP (mmHg)", y = "Density") +
+  theme_cap() +
+  theme(axis.title.y = element_blank(), legend.position = "right", legend.key.height = unit(2.2, "lines"),
+        plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panels E/F: Treatment attainment and rates by risk quartile, split by cohort
+rq_long <- rq_sum |>
+  tidyr::pivot_longer(
+    cols     = c(pct_ldl_target, pct_sbp_target, pct_on_statin, pct_on_aht),
+    names_to = "Metric", values_to = "Pct"
+  ) |>
+  dplyr::mutate(
+    Metric = factor(Metric,
+                    levels = c("pct_ldl_target", "pct_on_statin",
+                               "pct_sbp_target", "pct_on_aht"),
+                    labels = c("At LDL target", "On LLT",
+                               "At SBP target", "On AHT"))
+  )
+
+.make_rq_panel <- function(dat, tag, subtitle, show_legend = FALSE) {
+  dat <- dat |>
+    dplyr::filter(!is.na(risk_q)) |>
+    dplyr::mutate(risk_q = droplevels(risk_q)) |>
+    .recode_metric()
+  p <- ggplot(dat, aes(x = risk_q, y = Pct,
+               colour = Metric, group = Metric, shape = Metric)) +
+    geom_line(linewidth = 1.0) +
+    geom_point(size = 3.0) +
+    scale_colour_manual(values = .metric_pal, name = "Metric") +
+    scale_shape_manual(values  = .metric_shp, name = "Metric") +
+    scale_y_continuous(labels = scales::label_percent(scale = 1),
+                       limits = c(0, 100),
+                       expand = expansion(mult = c(0.02, 0.12))) +
+    labs(tag = tag,
+         x = "Baseline risk quartile", y = "Proportion") +
+    guides(colour = guide_legend(nrow = 4), shape = guide_legend(nrow = 4)) +
+    theme_cap() +
+    theme(legend.text       = element_text(size = 8),
+          legend.key.width  = unit(2, "lines"),
+          legend.key.height = unit(2.2, "lines"),
+          plot.tag          = element_text(face = "bold", size = 13))
+  if (show_legend) p + theme(legend.position = "right")
+  else             p + theme(legend.position = "none")
+}
+
+pQE <- .make_rq_panel(
+  rq_long |> dplyr::filter(Cohort == "DM (primary)"),
+  "E", "DM (primary)"
+)
+pQF <- .make_rq_panel(
+  rq_long |> dplyr::filter(Cohort == "ASCVD (secondary)"),
+  "F", "ASCVD (secondary)", show_legend = TRUE
+) + theme(axis.title.y = element_blank())
+
+fig6 <- (pQA | pQB) / (pQC | pQD) / (pQE | pQF) +
+  plot_layout(heights = c(1, 1, 0.9))
+fig6
+ggsave("figures/fig6.tiff", fig6, width = 11, height = 11 * 1.10, dpi = 300, compression = "lzw")
+```
+
+<br>
+<br>
+
+```{r suppl_fig2, fig.width=11, fig.asp=1.10, echo=FALSE}
+fig6
+```
+
+**Supplementary Figure 2.** Risk factor control and treatment intensity by baseline risk quartile. (A–B) LDL-C distributions. (C–D) SBP distributions. (E–F) LDL-C and SBP target attainment and treatment receipt.
+
+<br>
+<br>
+
+```{r sex_data, echo=FALSE}
+sex_pal <- c("Male" = "#2171B5", "Female" = "#CB181D")
+
+dm_sex    <- dm_scored    |>
+  dplyr::filter(!is.na(sex)) |>
+  dplyr::mutate(sex_f = factor(dplyr::if_else(sex == "M", "Male", "Female"),
+                               levels = c("Male", "Female")))
+ascvd_sex <- ascvd_scored |>
+  dplyr::filter(!is.na(sex)) |>
+  dplyr::mutate(sex_f = factor(dplyr::if_else(sex == "M", "Male", "Female"),
+                               levels = c("Male", "Female")))
+
+sex_sum <- dplyr::bind_rows(
+  dm_sex |>
+    dplyr::group_by(sex_f) |>
+    dplyr::summarise(
+      pct_ldl_target = 100 * mean(ldl <= 2.0,             na.rm = TRUE),
+      pct_sbp_target = 100 * mean(sbp <= 130,             na.rm = TRUE),
+      pct_on_statin  = 100 * mean(statin_rx_last6m == 1L, na.rm = TRUE),
+      pct_on_aht     = 100 * mean(treated_htn == 1L,      na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "DM (primary)"),
+  ascvd_sex |>
+    dplyr::group_by(sex_f) |>
+    dplyr::summarise(
+      pct_ldl_target = 100 * mean(ldl <= 1.8,             na.rm = TRUE),
+      pct_sbp_target = 100 * mean(sbp <= 130,             na.rm = TRUE),
+      pct_on_statin  = 100 * mean(statin_rx_last6m == 1L, na.rm = TRUE),
+      pct_on_aht     = 100 * mean(treated_htn == 1L,      na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+
+.sv <- function(co, sx, mt)
+  round(sex_sum[[mt]][sex_sum$Cohort == co & sex_sum$sex_f == sx], 1)
+pct_statin_f_dm  <- .sv("DM (primary)",      "Female", "pct_on_statin")
+pct_statin_m_dm  <- .sv("DM (primary)",      "Male",   "pct_on_statin")
+pct_statin_f_asc <- .sv("ASCVD (secondary)", "Female", "pct_on_statin")
+pct_statin_m_asc <- .sv("ASCVD (secondary)", "Male",   "pct_on_statin")
+pct_ldl_f_dm     <- .sv("DM (primary)",      "Female", "pct_ldl_target")
+pct_ldl_m_dm     <- .sv("DM (primary)",      "Male",   "pct_ldl_target")
+pct_ldl_f_asc    <- .sv("ASCVD (secondary)", "Female", "pct_ldl_target")
+pct_ldl_m_asc    <- .sv("ASCVD (secondary)", "Male",   "pct_ldl_target")
+```
+
+```{r fig_sex, include=FALSE}
+# ── Panels A/B: LDL-C distributions by sex ────────────────────────────────
+pSA <- ggplot(dm_sex |> dplyr::filter(!is.na(ldl)),
+              aes(x = ldl, colour = sex_f, fill = sex_f)) +
+  geom_density(alpha = 0.25, linewidth = 0.7) +
+  geom_vline(xintercept = 2.0, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 2.07, y = Inf, vjust = 1.8, hjust = 0,
+           label = "2.0 mmol/L", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = sex_pal, name = "Sex") +
+  scale_fill_manual(  values = sex_pal, name = "Sex") +
+  labs(tag = "A", title = "DM (primary)", x = "LDL-C (mmol/L)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "none", plot.tag = element_text(face = "bold", size = 13))
+
+pSB <- ggplot(ascvd_sex |> dplyr::filter(!is.na(ldl)),
+              aes(x = ldl, colour = sex_f, fill = sex_f)) +
+  geom_density(alpha = 0.25, linewidth = 0.7) +
+  geom_vline(xintercept = 1.8, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 1.87, y = Inf, vjust = 1.8, hjust = 0,
+           label = "1.8 mmol/L", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = sex_pal, name = "Sex") +
+  scale_fill_manual(  values = sex_pal, name = "Sex") +
+  labs(tag = "B", title = "ASCVD (secondary)", x = "LDL-C (mmol/L)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "right", axis.title.y = element_blank(),
+        plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panels C/D: SBP distributions by sex ──────────────────────────────────
+pSC <- ggplot(dm_sex |> dplyr::filter(!is.na(sbp)),
+              aes(x = sbp, colour = sex_f, fill = sex_f)) +
+  geom_density(alpha = 0.25, linewidth = 0.7) +
+  geom_vline(xintercept = 130, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 131, y = Inf, vjust = 1.8, hjust = 0,
+           label = "≤130 mmHg", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = sex_pal, name = "Sex") +
+  scale_fill_manual(  values = sex_pal, name = "Sex") +
+  labs(tag = "C", x = "SBP (mmHg)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "none", plot.tag = element_text(face = "bold", size = 13))
+
+pSD <- ggplot(ascvd_sex |> dplyr::filter(!is.na(sbp)),
+              aes(x = sbp, colour = sex_f, fill = sex_f)) +
+  geom_density(alpha = 0.25, linewidth = 0.7) +
+  geom_vline(xintercept = 130, linetype = "dashed", colour = "#555", linewidth = 0.6) +
+  annotate("text", x = 131, y = Inf, vjust = 1.8, hjust = 0,
+           label = "≤130 mmHg", size = 2.4, colour = "#555") +
+  scale_colour_manual(values = sex_pal, name = "Sex") +
+  scale_fill_manual(  values = sex_pal, name = "Sex") +
+  labs(tag = "D", x = "SBP (mmHg)", y = "Density") +
+  theme_cap() +
+  theme(legend.position = "right", axis.title.y = element_blank(),
+        plot.tag = element_text(face = "bold", size = 13))
+
+# ── Panels E/F: treatment metrics by sex (dodged bars) ────────────────────
+sex_long <- sex_sum |>
+  tidyr::pivot_longer(
+    cols     = c(pct_ldl_target, pct_on_statin, pct_sbp_target, pct_on_aht),
+    names_to = "Metric", values_to = "Pct"
+  ) |>
+  dplyr::mutate(
+    Metric = factor(Metric,
+                    levels = c("pct_ldl_target", "pct_on_statin",
+                               "pct_sbp_target", "pct_on_aht"),
+                    labels = c("At LDL target", "On LLT",
+                               "At SBP target", "On AHT"))
+  ) |>
+  .recode_metric()
+
+.sex_bar <- function(cohort_nm, tag, show_legend = FALSE) {
+  d <- sex_long |> dplyr::filter(Cohort == cohort_nm)
+  p <- ggplot(d, aes(x = Metric, y = Pct, fill = sex_f)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+    scale_fill_manual(values = sex_pal, name = "Sex") +
+    scale_y_continuous(labels = scales::label_percent(scale = 1),
+                       limits = c(0, 100),
+                       expand = expansion(mult = c(0, 0.08))) +
+    labs(tag = tag, x = NULL, y = "Proportion") +
+    theme_cap() +
+    theme(axis.text.x = element_text(size = 8),
+          plot.tag    = element_text(face = "bold", size = 13))
+  if (show_legend) p + theme(legend.position = "right")
+  else             p + theme(legend.position = "none")
+}
+
+pSE <- .sex_bar("DM (primary)",      "E")
+pSF <- .sex_bar("ASCVD (secondary)", "F", show_legend = TRUE)
+
+fig7 <- (pSA | pSB) / (pSC | pSD) / (pSE | pSF) +
+  plot_layout(heights = c(1, 1, 0.9))
+fig7
+ggsave("figures/fig7.tiff", fig7, width = 11, height = 11 * 1.1, dpi = 300, compression = "lzw")
+```
+
+<br>
+<br>
+
+```{r suppl_fig3, fig.width=11, fig.asp=1.1, echo=FALSE}
+fig7
+```
+
+```{r, echo=FALSE}
+
+ggsave(filename = 'fig7.tiff', plot = fig7, device = 'tiff', width=11, height=12, units ='in', dpi=300, compression = 'lzw')
+
+```
+
+**Supplementary Figure 3.** Risk factor control and treatment intensity by baseline risk quartile by sex. **(A, B)** LDL-C distributions; dashed lines mark guideline targets. **(C, D)** SBP distributions; dashed line marks 130 mmHg. **(E, F)** Target attainment and treatment receipt.
+
+<br>
+<br>
+
+## Base tables
+
+```{r rt_setup, include=FALSE}
+.mask_n <- function(x) dplyr::if_else(x < 10L, 10L, x)
+.mask_all_n <- function(df) dplyr::mutate(df, dplyr::across(
+  dplyr::matches("^N$|^N_|^N "), .mask_n))
+```
+
+<br>
+
+### RT1. Figure 1 panels A–B — Cardiovascular risk score distributions
+```{r rt1_risk, echo=FALSE}
+rt1 <- dplyr::bind_rows(
+  dm_scored |> dplyr::filter(!is.na(qrisk10y)) |>
+    dplyr::summarise(Cohort = "DM (primary)", Metric = "QRISK2 10y (%)",
+      N = dplyr::n(), Mean = round(mean(qrisk10y), 1), SD = round(sd(qrisk10y), 1),
+      Median = round(median(qrisk10y), 1),
+      Q1 = round(quantile(qrisk10y, 0.25), 1), Q3 = round(quantile(qrisk10y, 0.75), 1)),
+  ascvd_scored |> dplyr::filter(!is.na(react5y)) |>
+    dplyr::summarise(Cohort = "ASCVD (secondary)", Metric = "REACT 5y (%)",
+      N = dplyr::n(), Mean = round(mean(react5y), 1), SD = round(sd(react5y), 1),
+      Median = round(median(react5y), 1),
+      Q1 = round(quantile(react5y, 0.25), 1), Q3 = round(quantile(react5y, 0.75), 1))
+) |> .mask_all_n()
+kbl(rt1) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT2. Figure 1 panels C–D — LDL-C and SBP distributions
+```{r rt2_biomarkers, echo=FALSE}
+.rt_summ <- function(df, cohort, metric, col) {
+  df |> dplyr::filter(!is.na(.data[[col]])) |>
+    dplyr::summarise(
+      N      = dplyr::n(),
+      Mean   = round(mean(.data[[col]]), 2),
+      SD     = round(sd(.data[[col]]), 2),
+      Median = round(median(.data[[col]]), 2),
+      Q1     = round(quantile(.data[[col]], 0.25), 2),
+      Q3     = round(quantile(.data[[col]], 0.75), 2)
+    ) |>
+    dplyr::mutate(Cohort = cohort, Metric = metric, .before = 1)
+}
+rt2 <- dplyr::bind_rows(
+  .rt_summ(dm_scored,    "DM (primary)",      "LDL-C (mmol/L)", "ldl"),
+  .rt_summ(ascvd_scored, "ASCVD (secondary)", "LDL-C (mmol/L)", "ldl"),
+  .rt_summ(dm_scored,    "DM (primary)",      "SBP (mmHg)",     "sbp"),
+  .rt_summ(ascvd_scored, "ASCVD (secondary)", "SBP (mmHg)",     "sbp")
+) |> .mask_all_n()
+kbl(rt2) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT3. Figure 1 panels E–F — Treatment intensity proportions
+```{r rt3_treatment, echo=FALSE}
+rt3 <- treatment_rates |>
+  dplyr::mutate(
+    N_cohort   = dplyr::if_else(Cohort == "DM (primary)", nrow(dm_base), nrow(ascvd_base)),
+    N_category = round(N_cohort * Pct / 100)
+  ) |>
+  dplyr::select(Cohort, Treatment, Category = Label,
+                `N (cohort)` = N_cohort, `N (category)` = N_category, `%` = Pct) |>
+  dplyr::mutate(`%` = round(`%`, 1)) |>
+  .mask_all_n()
+kbl(rt3) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT4. Figure 2 panels A–B — Risk distributions under modelled scenarios
+```{r rt4_scenarios, echo=FALSE}
+.n_valid <- function(df, col) nrow(dplyr::filter(df, !is.na(.data[[col]])))
+rt4 <- dplyr::bind_rows(
+  scen_means_dm    |> dplyr::mutate(Cohort = "DM (primary)",      Risk = "QRISK2 10y (%)"),
+  scen_means_ascvd |> dplyr::mutate(Cohort = "ASCVD (secondary)", Risk = "REACT 5y (%)")
+) |>
+  dplyr::mutate(N = dplyr::if_else(Cohort == "DM (primary)",
+                                    .n_valid(dm_scored,    "qrisk10y"),
+                                    .n_valid(ascvd_scored, "react5y"))) |>
+  dplyr::select(Cohort, Risk, Scenario = scenario, N, Mean = mean_risk, Median = median_risk) |>
+  dplyr::mutate(dplyr::across(c(Mean, Median), \(x) round(x, 1))) |>
+  .mask_all_n()
+kbl(rt4) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT5. Figure 2 panels C–D — Events expected per 1,000 by risk quartile and scenario
+```{r rt5_events_expected, echo=FALSE}
+.n_by_q <- function(df, q_col) {
+  df |> dplyr::filter(!is.na(.data[[q_col]])) |>
+    dplyr::count(.data[[q_col]], name = "N") |>
+    dplyr::rename(risk_q = 1)
+}
+n_q_dm5    <- .n_by_q(dm_opp3,    "risk_q") |> dplyr::mutate(Cohort = "DM (primary)")
+n_q_ascvd5 <- .n_by_q(ascvd_opp3, "risk_q") |> dplyr::mutate(Cohort = "ASCVD (secondary)")
+
+rt5 <- opp3_central |>
+  dplyr::left_join(dplyr::bind_rows(n_q_dm5, n_q_ascvd5), by = c("Cohort","risk_q")) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q, N, Scenario = scenario,
+                Events_expected_per_1000 = events_expected) |>
+  dplyr::mutate(Events_expected_per_1000 = round(Events_expected_per_1000, 1)) |>
+  dplyr::arrange(Cohort, Risk_quartile, Scenario) |>
+  .mask_all_n()
+kbl(rt5) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT6. Figure 2 panels E–F — Events prevented per 1,000 by risk quartile (with 95% CI)
+```{r rt6_events_prevented, echo=FALSE}
+rt6 <- dplyr::left_join(
+  opp3_stacked |>
+    dplyr::select(Cohort, risk_q, Component = component,
+                  Events_prevented_per_1000 = events),
+  opp3_bar_err |>
+    dplyr::select(Cohort, risk_q, CI_lower = err_lo, CI_upper = err_hi),
+  by = c("Cohort","risk_q")
+) |>
+  dplyr::left_join(dplyr::bind_rows(n_q_dm5, n_q_ascvd5), by = c("Cohort","risk_q")) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q, N, Component,
+                Events_prevented_per_1000, CI_lower, CI_upper) |>
+  dplyr::mutate(dplyr::across(c(Events_prevented_per_1000, CI_lower, CI_upper),
+                               \(x) round(x, 1))) |>
+  dplyr::arrange(Cohort, Risk_quartile, Component) |>
+  .mask_all_n()
+kbl(rt6) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT7. Figure 3 panels A–B — LDL-C treatment status by risk quartile
+```{r rt7_ldl_status, echo=FALSE}
+rt7 <- dplyr::bind_rows(ldl_status_dm, ldl_status_ascvd) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q_lbl, Status = ldl_status, N = n, `%` = pct) |>
+  dplyr::mutate(`%` = round(`%`, 1)) |>
+  dplyr::arrange(Cohort, Risk_quartile, Status) |>
+  .mask_all_n()
+kbl(rt7) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT8. Figure 3 panels C–D — SBP treatment status by risk quartile
+```{r rt8_sbp_status, echo=FALSE}
+rt8 <- dplyr::bind_rows(sbp_status_dm, sbp_status_ascvd) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q_lbl, Status = sbp_status, N = n, `%` = pct) |>
+  dplyr::mutate(`%` = round(`%`, 1)) |>
+  dplyr::arrange(Cohort, Risk_quartile, Status) |>
+  .mask_all_n()
+kbl(rt8) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT9. Figure 3 panels E–F — Events prevented per 1,000 candidates by risk quartile (with 95% CI)
+```{r rt9_cand_ep, echo=FALSE}
+rt9_totals <- dplyr::bind_rows(cand_ep_dm, cand_ep_ascvd) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q_lbl, N_candidates = n_cand,
+                Events_prevented_per_1000 = ep_per1k, CI_lower = err_lo, CI_upper = err_hi) |>
+  dplyr::mutate(dplyr::across(c(Events_prevented_per_1000, CI_lower, CI_upper),
+                               \(x) round(x, 1))) |>
+  .mask_all_n()
+rt9_components <- dplyr::bind_rows(cand_stacked_dm, cand_stacked_ascvd) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q_lbl, Component = component,
+                Events_prevented_per_1000 = ep_per1k) |>
+  dplyr::mutate(Events_prevented_per_1000 = round(Events_prevented_per_1000, 1))
+kbl(rt9_totals,
+    caption = "Total events prevented per 1,000 candidates with 95% CI (error bar limits in figure)") |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+kbl(rt9_components,
+    caption = "Stacked bar components: all-candidates-treated vs additional-to-target") |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT10. Supplementary Figure 1 — Treatment receipt by WIMD quintile (with N per quintile)
+```{r rt10_wimd, echo=FALSE}
+n_wimd <- dplyr::bind_rows(
+  dm_wimd    |> dplyr::count(wimd_f, name = "N") |> dplyr::mutate(Cohort = "DM (primary)"),
+  ascvd_wimd |> dplyr::count(wimd_f, name = "N") |> dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+rt10 <- wimd_sum |>
+  dplyr::left_join(n_wimd, by = c("Cohort","wimd_f")) |>
+  dplyr::select(Cohort, WIMD_quintile = wimd_f, N,
+                `LDL at target (%)` = pct_ldl_target,
+                `SBP at target (%)` = pct_sbp_target,
+                `On statin (%)` = pct_on_statin,
+                `On AHT (%)` = pct_on_aht) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), \(x) round(x, 1))) |>
+  .mask_all_n()
+kbl(rt10) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT11. Supplementary Figure 2 — Treatment receipt by risk quartile (with N per quartile)
+```{r rt11_riskq, echo=FALSE}
+n_rq <- dplyr::bind_rows(
+  dm_q    |> dplyr::filter(!is.na(risk_q)) |>
+    dplyr::count(risk_q, name = "N") |> dplyr::mutate(Cohort = "DM (primary)"),
+  ascvd_q |> dplyr::filter(!is.na(risk_q)) |>
+    dplyr::count(risk_q, name = "N") |> dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+rt11 <- rq_sum |>
+  dplyr::left_join(n_rq, by = c("Cohort","risk_q")) |>
+  dplyr::select(Cohort, Risk_quartile = risk_q, N,
+                `LDL at target (%)` = pct_ldl_target,
+                `SBP at target (%)` = pct_sbp_target,
+                `On statin (%)` = pct_on_statin,
+                `On AHT (%)` = pct_on_aht) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), \(x) round(x, 1))) |>
+  .mask_all_n()
+kbl(rt11) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT12. Supplementary Figure 3 — Treatment receipt by sex (with N per group)
+```{r rt12_sex, echo=FALSE}
+n_sex <- dplyr::bind_rows(
+  dm_sex    |> dplyr::count(sex_f, name = "N") |> dplyr::mutate(Cohort = "DM (primary)"),
+  ascvd_sex |> dplyr::count(sex_f, name = "N") |> dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+rt12 <- sex_sum |>
+  dplyr::left_join(n_sex, by = c("Cohort","sex_f")) |>
+  dplyr::select(Cohort, Sex = sex_f, N,
+                `LDL at target (%)` = pct_ldl_target,
+                `SBP at target (%)` = pct_sbp_target,
+                `On statin (%)` = pct_on_statin,
+                `On AHT (%)` = pct_on_aht) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), \(x) round(x, 1))) |>
+  .mask_all_n()
+kbl(rt12) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
+
+<br>
+
+### RT13. Supplementary Figures 4–5 and Figure 5 — Treatment gap at WIMD × risk quartile intersection (with N per cell)
+```{r rt13_interact, echo=FALSE}
+n_ix <- dplyr::bind_rows(
+  ix_dm    |> dplyr::filter(!is.na(risk_q)) |>
+    dplyr::count(wimd_f, risk_q, name = "N") |> dplyr::mutate(Cohort = "DM (primary)"),
+  ix_ascvd |> dplyr::filter(!is.na(risk_q)) |>
+    dplyr::count(wimd_f, risk_q, name = "N") |> dplyr::mutate(Cohort = "ASCVD (secondary)")
+)
+rt13 <- ix_sum |>
+  dplyr::left_join(n_ix, by = c("Cohort","wimd_f","risk_q")) |>
+  dplyr::select(Cohort, WIMD_quintile = wimd_f, Risk_quartile = risk_q, N,
+                `LDL at target (%)` = pct_ldl_target,
+                `On statin (%)` = pct_on_statin,
+                `SBP at target (%)` = pct_sbp_target,
+                `On AHT (%)` = pct_on_aht,
+                `LDL untreated (%)` = pct_ldl_untreated,
+                `LDL undertreated (%)` = pct_ldl_undertreated,
+                `SBP untreated (%)` = pct_sbp_untreated,
+                `SBP undertreated (%)` = pct_sbp_undertreated) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), \(x) round(x, 1))) |>
+  dplyr::arrange(Cohort, WIMD_quintile, Risk_quartile) |>
+  .mask_all_n()
+kbl(rt13) |>
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE)
+```
+
